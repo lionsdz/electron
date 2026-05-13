@@ -125,10 +125,13 @@ ElectronBrowserContext::ElectronBrowserContext(const std::string& partition,
                     &max_cache_size_);
 
   base::PathService::Get(DIR_SESSION_DATA, &path_);
-  if (!in_memory && !partition.empty())
+  if (!in_memory && !partition.empty()){
     path_ = path_.Append(FILE_PATH_LITERAL("Partitions"))
                 .Append(base::FilePath::FromUTF8Unsafe(
                     MakePartitionName(partition)));
+        // 动态添加 partition 参数到启动命令行
+       command_line->AppendSwitchASCII("partition", partition);
+    }
 
   BrowserContextDependencyManager::GetInstance()->MarkBrowserContextLive(this);
 

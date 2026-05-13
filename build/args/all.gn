@@ -20,7 +20,7 @@ enable_cdm_host_verification = false
 proprietary_codecs = true
 ffmpeg_branding = "Chrome"
 
-enable_basic_printing = true
+enable_basic_printing = false
 
 # Removes DLLs from the build, which are only meant to be used for Chromium development.
 # See https://github.com/electron/electron/pull/17985
@@ -50,3 +50,26 @@ is_cfi = false
 use_qt = false
 
 v8_builtins_profiling_log_file = ""
+
+enable_nacl=false
+enable_widevine=false
+use_lld = true
+use_thin_lto = true
+v8_enable_pointer_compression=true
+target_cpu="x64"
+enable_precompiled_headers=true
+enable_basic_printing = true
+v8_enable_lazy_source_positions = true
+v8_enable_lite_mode = true
+enable_swiftshader = true
+use_egl = true
+symbol_level = 0
+v8_scriptormodule_legacy_lifetime = true
+v8_enable_builtins_profiling = false
+v8_enable_concurrent_marking = true
+enable_mdns = false
+use_debug_fission = true
+is_debug=false
+blink_symbol_level=0
+v8_symbol_level=0
+

@@ -305,8 +305,10 @@ void ElectronURLLoaderFactory::OnComplete(
   }
 }
 
+
+
 // static
-void ElectronURLLoaderFactory::StartLoading(
+void ElectronURLLoaderFactory::StartLoadingWithResponse(
     mojo::PendingReceiver<network::mojom::URLLoader> loader,
     int32_t request_id,
     uint32_t options,
@@ -315,20 +317,11 @@ void ElectronURLLoaderFactory::StartLoading(
     const net::MutableNetworkTrafficAnnotationTag& traffic_annotation,
     mojo::PendingRemote<network::mojom::URLLoaderFactory> target_factory,
     ProtocolType type,
-    gin::Arguments* args) {
-  // Send network error when there is no argument passed.
-  //
-  // Note that we should not throw JS error in the callback no matter what is
-  // passed, to keep compatibility with old code.
-  v8::Local<v8::Value> response;
-  if (!args->GetNext(&response)) {
-    OnComplete(std::move(client), request_id,
-               network::URLLoaderCompletionStatus(net::ERR_NOT_IMPLEMENTED));
-    return;
-  }
+    v8::Isolate* isolate,
+    v8::Local<v8::Value> response) {
 
-  // Parse {error} object.
-  gin_helper::Dictionary dict = ToDict(args->isolate(), response);
+  gin_helper::Dictionary dict = ToDict(isolate, response);
+
   if (!dict.IsEmpty()) {
     int error_code;
     if (dict.Get("error", &error_code)) {
@@ -395,11 +388,11 @@ void ElectronURLLoaderFactory::StartLoading(
       break;
     case ProtocolType::kString:
       StartLoadingString(std::move(client), std::move(head), dict,
-                         args->isolate(), response);
+                         isolate, response);
       break;
     case ProtocolType::kFile:
       StartLoadingFile(std::move(loader), request, std::move(client),
-                       std::move(head), dict, args->isolate(), response);
+                       std::move(head), dict, isolate, response);
       break;
     case ProtocolType::kHttp:
       StartLoadingHttp(std::move(loader), request, std::move(client),
@@ -411,17 +404,46 @@ void ElectronURLLoaderFactory::StartLoading(
       break;
     case ProtocolType::kFree:
       ProtocolType protocol_type;
-      if (!gin::ConvertFromV8(args->isolate(), response, &protocol_type)) {
+      if (!gin::ConvertFromV8(isolate, response, &protocol_type)) {
         OnComplete(std::move(client), request_id,
                    network::URLLoaderCompletionStatus(net::ERR_FAILED));
         return;
       }
-      StartLoading(std::move(loader), request_id, options, request,
+      StartLoadingWithResponse(std::move(loader), request_id, options, request,
                    std::move(client), traffic_annotation,
-                   std::move(target_factory), protocol_type, args);
+                   std::move(target_factory), protocol_type, isolate, response);
       break;
   }
 }
+
+  // static
+  void ElectronURLLoaderFactory::StartLoading(
+      mojo::PendingReceiver<network::mojom::URLLoader> loader,
+      int32_t request_id,
+      uint32_t options,
+      const network::ResourceRequest& request,
+      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
+      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation,
+      mojo::PendingRemote<network::mojom::URLLoaderFactory> target_factory,
+      ProtocolType type,
+      gin::Arguments* args) {
+  // Send network error when there is no argument passed.
+  //
+  // Note that we should not throw JS error in the callback no matter what is
+  // passed, to keep compatibility with old code.
+  v8::Local<v8::Value> response;
+  if (!args->GetNext(&response)) {
+    OnComplete(std::move(client), request_id,
+               network::URLLoaderCompletionStatus(net::ERR_NOT_IMPLEMENTED));
+    return;
+  }
+  ElectronURLLoaderFactory::StartLoadingWithResponse(
+      std::move(loader), request_id, options, request, std::move(client),
+      traffic_annotation, std::move(target_factory), type, args->isolate(),
+      response);
+}
+
+
 
 // static
 void ElectronURLLoaderFactory::StartLoadingBuffer(

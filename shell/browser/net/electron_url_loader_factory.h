@@ -25,6 +25,8 @@
 
 namespace electron {
 
+const uint32_t kBypassCustomProtocolHandlers = 1 << 30;
+
 // Old Protocol API can only serve one type of response for one scheme.
 enum class ProtocolType {
   kBuffer,
@@ -109,7 +111,7 @@ class ElectronURLLoaderFactory : public network::SelfDeletingURLLoaderFactory {
       const net::MutableNetworkTrafficAnnotationTag& traffic_annotation)
       override;
 
-  static void StartLoading(
+    static void StartLoadingWithResponse(
       mojo::PendingReceiver<network::mojom::URLLoader> loader,
       int32_t request_id,
       uint32_t options,
@@ -118,7 +120,8 @@ class ElectronURLLoaderFactory : public network::SelfDeletingURLLoaderFactory {
       const net::MutableNetworkTrafficAnnotationTag& traffic_annotation,
       mojo::PendingRemote<network::mojom::URLLoaderFactory> target_factory,
       ProtocolType type,
-      gin::Arguments* args);
+      v8::Isolate* isolate,
+      v8::Local<v8::Value> response);
 
   // disable copy
   ElectronURLLoaderFactory(const ElectronURLLoaderFactory&) = delete;
@@ -130,6 +133,17 @@ class ElectronURLLoaderFactory : public network::SelfDeletingURLLoaderFactory {
       const ProtocolHandler& handler,
       mojo::PendingReceiver<network::mojom::URLLoaderFactory> factory_receiver);
   ~ElectronURLLoaderFactory() override;
+
+    static void StartLoading(
+      mojo::PendingReceiver<network::mojom::URLLoader> loader,
+      int32_t request_id,
+      uint32_t options,
+      const network::ResourceRequest& request,
+      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
+      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation,
+      mojo::PendingRemote<network::mojom::URLLoaderFactory> target_factory,
+      ProtocolType type,
+      gin::Arguments* args);
 
   static void OnComplete(
       mojo::PendingRemote<network::mojom::URLLoaderClient> client,

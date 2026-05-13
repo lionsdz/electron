@@ -790,6 +790,39 @@ bool ProxyingURLLoaderFactory::ShouldIgnoreConnectionsLimit(
   return false;
 }
 
+  // static
+  void ProxyingURLLoaderFactory::StartLoading(
+      mojo::PendingReceiver<network::mojom::URLLoader> loader,
+      int32_t request_id,
+      uint32_t options,
+      const network::ResourceRequest& request,
+      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
+      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation,
+      mojo::PendingRemote<network::mojom::URLLoaderFactory> target_factory,
+      ProtocolType type,
+      gin::Arguments* args) {
+  v8::Local<v8::Value> response;
+  if (!args->GetNext(&response) || response->IsNullOrUndefined() ||
+      (response->IsObject() &&
+       response.As<v8::Object>()
+               ->GetOwnPropertyNames(args->isolate()->GetCurrentContext())
+               .ToLocalChecked()
+               ->Length() == 0)) {
+    mojo::Remote<network::mojom::URLLoaderFactory> target_factory_remote(
+        std::move(target_factory));
+    // trigger receiver of itself but with kBypassCustomProtocolHandlers
+    target_factory_remote->CreateLoaderAndStart(
+        std::move(loader), request_id, options | kBypassCustomProtocolHandlers,
+        request, std::move(client), traffic_annotation);
+    return;
+               }
+  ElectronURLLoaderFactory::StartLoadingWithResponse(
+      std::move(loader), request_id, options, request, std::move(client),
+      traffic_annotation, std::move(target_factory), type, args->isolate(),
+      response);
+}
+
+
 void ProxyingURLLoaderFactory::CreateLoaderAndStart(
     mojo::PendingReceiver<network::mojom::URLLoader> loader,
     int32_t request_id,
@@ -806,6 +839,10 @@ void ProxyingURLLoaderFactory::CreateLoaderAndStart(
   }
 
   // Check if user has intercepted this scheme.
+  bool bypass_custom_protocol_handlers =
+      options & kBypassCustomProtocolHandlers;
+  if (!bypass_custom_protocol_handlers) {
+  // Check if user has intercepted this scheme.
   auto it = intercepted_handlers_.find(request.url.scheme());
   if (it != intercepted_handlers_.end()) {
     mojo::PendingRemote<network::mojom::URLLoaderFactory> loader_remote;
@@ -813,11 +850,12 @@ void ProxyingURLLoaderFactory::CreateLoaderAndStart(
 
     // <scheme, <type, handler>>
     it->second.second.Run(
-        request, base::BindOnce(&ElectronURLLoaderFactory::StartLoading,
+        request, base::BindOnce(&ProxyingURLLoaderFactory::StartLoading,
                                 std::move(loader), request_id, options, request,
                                 std::move(client), traffic_annotation,
                                 std::move(loader_remote), it->second.first));
     return;
+    }
   }
 
   // The loader of ServiceWorker forbids loading scripts from file:// URLs, and

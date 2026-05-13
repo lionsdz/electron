@@ -508,6 +508,7 @@ export const wrapFsWithAsar = (fs: Record<string, any>) => {
     }
   };
 
+
   function fsReadFileAsar (pathArgument: string, options: any, callback: any) {
     const pathInfo = splitPath(pathArgument);
     if (pathInfo.isAsar) {
