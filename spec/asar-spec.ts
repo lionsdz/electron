@@ -338,6 +338,38 @@ describe('asar package', function () {
         const p = path.join(asarDir, 'a.asar', 'not-exist');
         await expectToThrowErrorWithCode(() => fs.promises.readFile(p), 'ENOENT');
       });
+
+      itremote('rejects invalid options instead of throwing synchronously', async function () {
+        const p = path.join(asarDir, 'a.asar', 'file1');
+        let promise: Promise<Buffer> | undefined;
+        expect(() => { promise = fs.promises.readFile(p, 42 as any); }).not.to.throw();
+        await expect(promise).to.be.eventually.rejectedWith(TypeError);
+      });
+
+      itremote('rejects an aborted read without exposing archive bytes', async function () {
+        const p = path.join(asarDir, 'a.asar', 'file1');
+        const controller = new AbortController();
+        controller.abort();
+        await expectToThrowErrorWithCode(
+          () => fs.promises.readFile(p, { signal: controller.signal }),
+          'ABORT_ERR');
+      });
+
+      itremote('rejects when an in-flight archive read is aborted', async function () {
+        const p = path.join(asarDir, 'a.asar', 'file1');
+        const controller = new AbortController();
+        const promise = fs.promises.readFile(
+          p, { signal: controller.signal });
+        controller.abort();
+        await expectToThrowErrorWithCode(() => promise, 'ABORT_ERR');
+      });
+
+      itremote('rejects an invalid signal instead of ignoring it', async function () {
+        const p = path.join(asarDir, 'a.asar', 'file1');
+        await expectToThrowErrorWithCode(
+          () => fs.promises.readFile(p, { signal: 1 } as any),
+          'ERR_INVALID_ARG_TYPE');
+      });
     });
 
     describe('fs.copyFile', function () {

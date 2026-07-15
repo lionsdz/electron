@@ -22,41 +22,73 @@ const nextTick = (functionToCall: Function, args: any[] = []) => {
 };
 
 // Cache asar archive objects.
-const cachedArchives = new Map<string, NodeJS.AsarArchive>();
+const maxCachedArchives = 32;
+const cachedArchives = new Map<string, WeakRef<NodeJS.AsarArchive>>();
+const archiveInitializationErrors = new Map<string, Error>();
+
+const rememberBounded = <T> (cache: Map<string, T>, key: string, value: T) => {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > maxCachedArchives) {
+    cache.delete(cache.keys().next().value!);
+  }
+};
 
 const getOrCreateArchive = (archivePath: string) => {
-  const isCached = cachedArchives.has(archivePath);
-  if (isCached) {
-    return cachedArchives.get(archivePath)!;
+  const cachedRef = cachedArchives.get(archivePath);
+  const cached = cachedRef?.deref();
+  if (cached) {
+    // Map insertion order is the LRU list; refresh without another object.
+    rememberBounded(cachedArchives, archivePath, cachedRef!);
+    return cached;
   }
+  if (cachedRef) cachedArchives.delete(archivePath);
 
   try {
     const newArchive = new asar.Archive(archivePath);
-    cachedArchives.set(archivePath, newArchive);
+    rememberBounded(cachedArchives, archivePath, new WeakRef(newArchive));
+    archiveInitializationErrors.delete(archivePath);
     return newArchive;
-  } catch {
+  } catch (cause) {
+    const error = cause instanceof Error ? cause : new Error(String(cause));
+    rememberBounded(archiveInitializationErrors, archivePath, error);
     return null;
   }
 };
 
 process._getOrCreateArchive = getOrCreateArchive;
 
-const asarRe = /\.asar/i;
+const asarRe = /(?:^|[\\/])[^\\/]*\.asar(?:[\\/]|$)/i;
 
-// Separate asar package's path from full path.
-const splitPath = (archivePathOrBuffer: string | Buffer) => {
-  // Shortcut for disabled asar.
-  if (isAsarDisabled()) return { isAsar: <const>false };
-
-  // Check for a bad argument type.
+// This check is deliberately lexical. Async readFile passes the normalized
+// candidate to a worker, which performs the filesystem-dependent split there.
+const normalizeAsarPathCandidate = (archivePathOrBuffer: string | Buffer) => {
+  if (isAsarDisabled()) return null;
   let archivePath = archivePathOrBuffer;
   if (Buffer.isBuffer(archivePathOrBuffer)) {
     archivePath = archivePathOrBuffer.toString();
   }
-  if (typeof archivePath !== 'string') return { isAsar: <const>false };
-  if (!asarRe.test(archivePath)) return { isAsar: <const>false };
+  if (typeof archivePath !== 'string') return null;
+  if (!asarRe.test(archivePath)) return null;
+  const normalized = path.normalize(archivePath);
+  return normalized;
+};
 
-  return asar.splitPath(path.normalize(archivePath));
+// Separate asar package's path from full path for synchronous APIs.
+const splitPath = (archivePathOrBuffer: string | Buffer) => {
+  const candidate = normalizeAsarPathCandidate(archivePathOrBuffer);
+  return candidate ? asar.splitPath(candidate) : { isAsar: <const>false };
+};
+
+const decodeAndCleanseBuffer = (buffer: Buffer, encoding: BufferEncoding | null) => {
+  if (!encoding) return buffer;
+  try {
+    return buffer.toString(encoding);
+  } finally {
+    // The returned string owns its encoded copy. Release encrypted plaintext
+    // promptly instead of waiting for the external Buffer's GC finalizer.
+    buffer.fill(0);
+  }
 };
 
 // Convert asar archive's Stats object to fs's Stats object.
@@ -105,7 +137,14 @@ const enum AsarError {
   INVALID_ARCHIVE = 'INVALID_ARCHIVE'
 }
 
-type AsarErrorObject = Error & { code?: string, errno?: number };
+type AsarErrorObject = Error & {
+  code?: string,
+  errno?: number,
+  easrError?: string,
+  asarPath?: string,
+  filePath?: string,
+  path?: string
+};
 
 const createError = (errorType: AsarError, { asarPath, filePath }: { asarPath?: string, filePath?: string } = {}) => {
   let error: AsarErrorObject;
@@ -114,24 +153,53 @@ const createError = (errorType: AsarError, { asarPath, filePath }: { asarPath?: 
       error = new Error(`ENOENT, ${filePath} not found in ${asarPath}`);
       error.code = 'ENOENT';
       error.errno = -2;
+      error.easrError = 'ERR_ASAR_NOT_FOUND';
       break;
     case AsarError.NOT_DIR:
       error = new Error('ENOTDIR, not a directory');
       error.code = 'ENOTDIR';
       error.errno = -20;
+      error.easrError = 'ERR_ASAR_NOT_DIR';
       break;
     case AsarError.NO_ACCESS:
       error = new Error(`EACCES: permission denied, access '${filePath}'`);
       error.code = 'EACCES';
       error.errno = -13;
+      error.easrError = 'ERR_ASAR_NO_ACCESS';
       break;
     case AsarError.INVALID_ARCHIVE:
-      error = new Error(`Invalid package ${asarPath}`);
+      {
+        const nativeError = asarPath && archiveInitializationErrors.get(asarPath) as AsarErrorObject | undefined;
+        if (nativeError) {
+          error = Object.assign(new Error(nativeError.message), {
+            code: nativeError.code ?? 'EIO',
+            errno: nativeError.errno ?? -5,
+            easrError: nativeError.easrError ?? 'ERR_ASAR_INVALID_ARCHIVE',
+            asarPath
+          });
+        } else {
+          error = new Error(`Invalid package ${asarPath}`);
+          error.code = 'EIO';
+          error.errno = -5;
+          error.easrError = 'ERR_ASAR_INVALID_ARCHIVE';
+          error.asarPath = asarPath;
+        }
+      }
       break;
     default:
       throw new Error(`Invalid error type "${errorType}" passed to createError.`);
   }
+  if (asarPath) error.asarPath = asarPath;
+  if (filePath) {
+    error.filePath = filePath;
+    error.path = asarPath ? path.join(asarPath, filePath) : filePath;
+  }
   return error;
+};
+
+const shouldSurfaceArchiveInitializationError = (asarPath: string) => {
+  const error = archiveInitializationErrors.get(asarPath) as AsarErrorObject | undefined;
+  return error?.easrError?.startsWith('ERR_EASR_') === true;
 };
 
 const overrideAPISync = function (module: Record<string, any>, name: string, pathArgumentIndex?: number | null, fromAsync: boolean = false) {
@@ -508,84 +576,142 @@ export const wrapFsWithAsar = (fs: Record<string, any>) => {
     }
   };
 
-
-  function fsReadFileAsar (pathArgument: string, options: any, callback: any) {
-    const pathInfo = splitPath(pathArgument);
-    if (pathInfo.isAsar) {
-      const { asarPath, filePath } = pathInfo;
-
-      if (typeof options === 'function') {
-        callback = options;
-        options = { encoding: null };
-      } else if (typeof options === 'string') {
-        options = { encoding: options };
-      } else if (options === null || options === undefined) {
-        options = { encoding: null };
-      } else if (typeof options !== 'object') {
-        throw new TypeError('Bad arguments');
-      }
-
-      const { encoding } = options;
-      const archive = getOrCreateArchive(asarPath);
-      if (!archive) {
-        const error = createError(AsarError.INVALID_ARCHIVE, { asarPath });
-        nextTick(callback, [error]);
-        return;
-      }
-
-      const info = archive.getFileInfo(filePath);
-      if (!info) {
-        const error = createError(AsarError.NOT_FOUND, { asarPath, filePath });
-        nextTick(callback, [error]);
-        return;
-      }
-
-      if (info.size === 0) {
-        nextTick(callback, [null, encoding ? '' : Buffer.alloc(0)]);
-        return;
-      }
-
-      if (info.unpacked) {
-        const realPath = archive.copyFileOut(filePath);
-        return fs.readFile(realPath, options, callback);
-      }
-
-      const buffer = Buffer.alloc(info.size);
-      const fd = archive.getFdAndValidateIntegrityLater();
-      if (!(fd >= 0)) {
-        const error = createError(AsarError.NOT_FOUND, { asarPath, filePath });
-        nextTick(callback, [error]);
-        return;
-      }
-
-      logASARAccess(asarPath, filePath, info.offset);
-      fs.read(fd, buffer, 0, info.size, info.offset, (error: Error) => {
-        validateBufferIntegrity(buffer, info.integrity);
-        callback(error, encoding ? buffer.toString(encoding) : buffer);
-      });
-    }
-  }
-
   const { readFile } = fs;
-  fs.readFile = function (pathArgument: string, options: any, callback: any) {
-    const pathInfo = splitPath(pathArgument);
-    if (!pathInfo.isAsar) {
-      return readFile.apply(this, arguments);
-    }
+  const { readFile: readFilePromise } = fs.promises;
 
-    return fsReadFileAsar(pathArgument, options, callback);
+  const normalizeReadFileOptions = (options: any) => {
+    if (typeof options === 'string') return { encoding: options };
+    if (options === null || options === undefined ||
+        typeof options === 'function') return { encoding: null };
+    if (typeof options !== 'object') throw new TypeError('Bad arguments');
+    const { signal } = options;
+    if (signal !== undefined &&
+        (signal === null || typeof signal !== 'object' ||
+         !('aborted' in signal))) {
+      const error = new TypeError(
+        'options.signal must be an AbortSignal') as NodeJS.ErrnoException;
+      error.code = 'ERR_INVALID_ARG_TYPE';
+      throw error;
+    }
+    return options;
   };
 
-  const { readFile: readFilePromise } = fs.promises;
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  fs.promises.readFile = function (pathArgument: string, options: any) {
-    const pathInfo = splitPath(pathArgument);
-    if (!pathInfo.isAsar) {
+  const createReadFileAbortError = (signal: any) => {
+    const error: NodeJS.ErrnoException & { cause?: any } =
+      new Error('The operation was aborted');
+    error.name = 'AbortError';
+    error.code = 'ABORT_ERR';
+    error.cause = signal.reason;
+    return error;
+  };
+
+  const runWithReadFileAbortSignal = <T>(
+    signal: any,
+    operation: () => Promise<T>
+  ): Promise<T> => {
+    if (signal === undefined) return operation();
+    if (signal.aborted) return Promise.reject(createReadFileAbortError(signal));
+    if (typeof signal.addEventListener !== 'function' ||
+        typeof signal.removeEventListener !== 'function') {
+      return operation().then(value => {
+        if (!signal.aborted) return value;
+        if (Buffer.isBuffer(value)) value.fill(0);
+        throw createReadFileAbortError(signal);
+      });
+    }
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => signal.removeEventListener('abort', onAbort);
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(createReadFileAbortError(signal));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (settled) return;
+      if (signal.aborted) return onAbort();
+      let result: Promise<T>;
+      try {
+        result = operation();
+      } catch (error) {
+        settled = true;
+        cleanup();
+        reject(error);
+        return;
+      }
+      result.then(value => {
+        if (settled) {
+          if (Buffer.isBuffer(value)) value.fill(0);
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(value);
+      }, error => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      });
+    });
+  };
+
+  const fsReadFileAsarPromise = (
+    pathArgument: string | Buffer,
+    rawOptions: any,
+    candidate: string
+  ): Promise<Buffer | string> => {
+    const options = normalizeReadFileOptions(rawOptions);
+    const { encoding, signal } = options;
+    return runWithReadFileAbortSignal(signal, () => {
+      // Keep diagnostic logging opt-in: normal reads avoid synchronous archive
+      // initialization and metadata work entirely.
+      if (process.env.ELECTRON_LOG_ASAR_READS) {
+        const pathInfo = splitPath(pathArgument);
+        if (pathInfo.isAsar) {
+          const archive = getOrCreateArchive(pathInfo.asarPath);
+          const info = archive?.getFileInfo(pathInfo.filePath);
+          if (info) logASARAccess(pathInfo.asarPath, pathInfo.filePath, info.offset);
+        }
+      }
+      return asar.readFileAsync(candidate);
+    }).then(buffer => {
+      // A directory ending in .asar is an ordinary filesystem path. The
+      // worker returns undefined after checking it without blocking this
+      // environment's event loop.
+      if (buffer === undefined) return readFilePromise(pathArgument, options);
+      return decodeAndCleanseBuffer(buffer, encoding);
+    });
+  };
+
+  fs.readFile = function (pathArgument: string | Buffer, options: any, callback: any) {
+    const candidate = normalizeAsarPathCandidate(pathArgument);
+    if (!candidate) {
+      return readFile.apply(this, arguments);
+    }
+    if (typeof options === 'function') {
+      callback = options;
+      options = undefined;
+    }
+    if (typeof callback !== 'function') {
+      throw new TypeError('Callback must be a function');
+    }
+    fsReadFileAsarPromise(pathArgument, options, candidate).then(
+      value => nextTick(callback, [null, value]),
+      error => nextTick(callback, [error]));
+  };
+
+  fs.promises.readFile = function (pathArgument: string | Buffer, options: any) {
+    const candidate = normalizeAsarPathCandidate(pathArgument);
+    if (!candidate) {
       return readFilePromise.apply(this, arguments);
     }
-
-    const p = util.promisify(fsReadFileAsar);
-    return p(pathArgument, options);
+    try {
+      return fsReadFileAsarPromise(pathArgument, options, candidate);
+    } catch (error) {
+      return Promise.reject(error);
+    }
   };
 
   const { readFileSync } = fs;
@@ -600,12 +726,6 @@ export const wrapFsWithAsar = (fs: Record<string, any>) => {
     const info = archive.getFileInfo(filePath);
     if (!info) throw createError(AsarError.NOT_FOUND, { asarPath, filePath });
 
-    if (info.size === 0) return (options) ? '' : Buffer.alloc(0);
-    if (info.unpacked) {
-      const realPath = archive.copyFileOut(filePath);
-      return fs.readFileSync(realPath, options);
-    }
-
     if (!options) {
       options = { encoding: null };
     } else if (typeof options === 'string') {
@@ -615,9 +735,22 @@ export const wrapFsWithAsar = (fs: Record<string, any>) => {
     }
 
     const { encoding } = options;
-    const buffer = Buffer.alloc(info.size);
     const fd = archive.getFdAndValidateIntegrityLater();
-    if (!(fd >= 0)) throw createError(AsarError.NOT_FOUND, { asarPath, filePath });
+    if (!(fd >= 0)) {
+      if (BUILDFLAG(ENABLE_EASR_V2)) {
+        const buffer = archive.readFile(filePath);
+        if (!buffer) throw createError(AsarError.NOT_FOUND, { asarPath, filePath });
+        return decodeAndCleanseBuffer(buffer, encoding);
+      }
+      throw createError(AsarError.NOT_FOUND, { asarPath, filePath });
+    }
+    if (info.size === 0) return encoding ? '' : Buffer.alloc(0);
+    if (info.unpacked) {
+      const realPath = archive.copyFileOut(filePath);
+      return fs.readFileSync(realPath, options);
+    }
+
+    const buffer = Buffer.alloc(info.size);
 
     logASARAccess(asarPath, filePath, info.offset);
     fs.readSync(fd, buffer, 0, info.size, info.offset);
@@ -723,10 +856,25 @@ export const wrapFsWithAsar = (fs: Record<string, any>) => {
     const { asarPath, filePath } = pathInfo;
 
     const archive = getOrCreateArchive(asarPath);
-    if (!archive) return [];
+    if (!archive) {
+      if (shouldSurfaceArchiveInitializationError(asarPath)) {
+        throw createError(AsarError.INVALID_ARCHIVE, { asarPath });
+      }
+      return [];
+    }
 
     const info = archive.getFileInfo(filePath);
     if (!info) return [];
+    const fd = archive.getFdAndValidateIntegrityLater();
+    if (!(fd >= 0)) {
+      if (BUILDFLAG(ENABLE_EASR_V2)) {
+        const buffer = archive.readFile(filePath);
+        if (!buffer) return [];
+        const str = buffer.toString('utf8');
+        return [str, str.length > 0];
+      }
+      return [];
+    }
     if (info.size === 0) return ['', false];
     if (info.unpacked) {
       const realPath = archive.copyFileOut(filePath);
@@ -735,8 +883,6 @@ export const wrapFsWithAsar = (fs: Record<string, any>) => {
     }
 
     const buffer = Buffer.alloc(info.size);
-    const fd = archive.getFdAndValidateIntegrityLater();
-    if (!(fd >= 0)) return [];
 
     logASARAccess(asarPath, filePath, info.offset);
     fs.readSync(fd, buffer, 0, info.size, info.offset);
@@ -751,9 +897,13 @@ export const wrapFsWithAsar = (fs: Record<string, any>) => {
     if (!pathInfo.isAsar) return internalModuleStat(pathArgument);
     const { asarPath, filePath } = pathInfo;
 
-    // -ENOENT
     const archive = getOrCreateArchive(asarPath);
-    if (!archive) return -34;
+    if (!archive) {
+      if (shouldSurfaceArchiveInitializationError(asarPath)) {
+        throw createError(AsarError.INVALID_ARCHIVE, { asarPath });
+      }
+      return -34;
+    }
 
     // -ENOENT
     const stats = archive.stat(filePath);

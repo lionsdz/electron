@@ -11,9 +11,13 @@
 #include "base/mac/bundle_locations.h"
 #include "base/mac/scoped_nsautorelease_pool.h"
 #include "content/public/app/content_main.h"
+#include "electron/buildflags/buildflags.h"
 #include "electron/fuses.h"
 #include "shell/app/electron_main_delegate.h"
 #include "shell/app/node_main.h"
+#if BUILDFLAG(ENABLE_EASR_V2)
+#include "shell/common/asar/archive.h"
+#endif
 #include "shell/common/electron_command_line.h"
 #include "shell/common/mac/main_application_bundle.h"
 
@@ -41,6 +45,9 @@ int ElectronInitializeICUandStartNode(int argc, char* argv[]) {
           .Append("Frameworks")
           .Append(ELECTRON_PRODUCT_NAME " Framework.framework"));
   base::i18n::InitializeICU();
+#if BUILDFLAG(ENABLE_EASR_V2)
+  asar::InstallEasrBuildPolicy();
+#endif
   return electron::NodeMain(argc, argv);
 }
 #endif

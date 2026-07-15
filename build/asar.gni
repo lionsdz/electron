@@ -1,3 +1,5 @@
+import("//electron/buildflags/buildflags.gni")
+
 template("node_action") {
   assert(defined(invoker.script), "Need script path to run")
   assert(defined(invoker.args), "Need script arguments")
@@ -35,16 +37,65 @@ template("asar") {
                              "args",
                            ])
 
-    script = "//electron/script/gn-asar.js"
-    args = [
-             "--base",
-             rebase_path(root),
-             "--files",
-           ] + rebase_path(sources) +
-           [
-             "--out",
-             rebase_path(outputs[0]),
-           ]
+    if (enable_easar_v2) {
+      script = "//electron/script/gn-easar-v2.js"
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += [ "//electron:easr_v2_key_material" ]
+      if (!defined(inputs)) {
+        inputs = []
+      }
+      inputs += [
+        "$root_gen_dir/electron/easr_v2_key_ids.json",
+        easar_v2_data_key_file,
+        easar_v2_signing_private_key_file,
+        easar_v2_signing_public_key_file,
+        "//electron/script/lib/easar-v2-build.js",
+        "//electron/script/lib/easar-v2-format.js",
+        "//electron/script/lib/easar-v2-packer.js",
+      ]
+      args = [
+               "--base",
+               rebase_path(root),
+               "--files",
+             ] + rebase_path(sources) +
+             [
+               "--out",
+               rebase_path(outputs[0]),
+               "--data-key-file",
+               rebase_path(easar_v2_data_key_file),
+               "--signing-private-key-file",
+               rebase_path(easar_v2_signing_private_key_file),
+               "--signing-public-key-file",
+               rebase_path(easar_v2_signing_public_key_file),
+               "--key-id-manifest",
+               rebase_path("$root_gen_dir/electron/easr_v2_key_ids.json"),
+               "--epoch",
+               easar_v2_epoch,
+               "--block-size-log2",
+               "$easar_v2_block_size_log2",
+               "--compression-level",
+               "$easar_v2_compression_level",
+             ]
+      if (!easar_v2_enable_compression) {
+        args += [ "--no-compress" ]
+      }
+      if (easar_v2_trust_windows_key_acl) {
+        args += [ "--trust-windows-key-acl" ]
+      }
+    } else {
+      script = "//electron/script/gn-asar.js"
+      args = [
+               "--base",
+               rebase_path(root),
+               "--files",
+             ] + rebase_path(sources) +
+             [
+               "--out",
+               rebase_path(outputs[0]),
+             ]
+    }
   }
 
   node_action(target_name + "_header_hash") {
@@ -54,6 +105,9 @@ template("asar") {
     sources = invoker.outputs
 
     script = "//electron/script/gn-asar-hash.js"
+    if (enable_easar_v2) {
+      inputs = [ "//electron/script/lib/easar-v2-format.js" ]
+    }
     outputs = [ "$target_gen_dir/asar_hashes/$target_name.hash" ]
 
     args = [

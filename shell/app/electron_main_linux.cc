@@ -15,6 +15,9 @@
 #include "shell/app/electron_main_delegate.h"  // NOLINT
 #include "shell/app/node_main.h"
 #include "shell/app/uv_stdio_fix.h"
+#if BUILDFLAG(ENABLE_EASR_V2)
+#include "shell/common/asar/archive.h"
+#endif
 #include "shell/common/electron_command_line.h"
 #include "shell/common/electron_constants.h"
 
@@ -27,6 +30,9 @@ int main(int argc, char* argv[]) {
       indicator[0] != '\0') {
     base::i18n::InitializeICU();
     base::AtExitManager atexit_manager;
+#if BUILDFLAG(ENABLE_EASR_V2)
+    asar::InstallEasrBuildPolicy();
+#endif
     return electron::NodeMain(argc, argv);
   }
 #endif

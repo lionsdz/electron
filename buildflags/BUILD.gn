@@ -20,5 +20,7 @@ buildflag_header("buildflags") {
     "ENABLE_BUILTIN_SPELLCHECKER=$enable_builtin_spellchecker",
     "ENABLE_PICTURE_IN_PICTURE=$enable_picture_in_picture",
     "OVERRIDE_LOCATION_PROVIDER=$enable_fake_location_provider",
+    "ENABLE_EASR_V2=$enable_easar_v2",
+    "REQUIRE_ENCRYPTED_ASAR=$easar_v2_require_encrypted",
   ]
 }

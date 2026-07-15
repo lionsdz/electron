@@ -256,6 +256,37 @@ action("generate_config_gypi") {
   args = rebase_path(outputs) + [ target_cpu ]
 }
 
+if (enable_easar_v2) {
+  node_action("easr_v2_key_material") {
+    script = "//electron/script/generate-easar-v2-key-header.js"
+    inputs = [
+      easar_v2_data_key_file,
+      easar_v2_signing_public_key_file,
+      "//electron/script/lib/easar-v2-build.js",
+      "//electron/script/lib/easar-v2-format.js",
+    ]
+    outputs = [
+      "$root_gen_dir/electron/easr_v2_key_material.h",
+      "$root_gen_dir/electron/easr_v2_key_ids.json",
+    ]
+    args = [
+      "--data-key-file",
+      rebase_path(easar_v2_data_key_file),
+      "--signing-public-key-file",
+      rebase_path(easar_v2_signing_public_key_file),
+      "--minimum-epoch",
+      easar_v2_epoch,
+      "--out",
+      rebase_path(outputs[0]),
+      "--key-id-manifest-out",
+      rebase_path(outputs[1]),
+    ]
+    if (easar_v2_trust_windows_key_acl) {
+      args += [ "--trust-windows-key-acl" ]
+    }
+  }
+}
+
 target_gen_default_app_js = "$target_gen_dir/js/default_app"
 
 typescript_build("default_app_js") {
@@ -484,6 +515,13 @@ source_set("electron_lib") {
     "//v8:v8_libplatform",
   ]
 
+  if (enable_easar_v2) {
+    deps += [
+      ":easr_v2_key_material",
+      "//third_party/zlib",
+    ]
+  }
+
   public_deps = [
     "//base",
     "//base:i18n",
@@ -514,6 +552,12 @@ source_set("electron_lib") {
   }
 
   sources = filenames.lib_sources
+  if (enable_easar_v2) {
+    sources += [
+      "shell/common/asar/easar_v2.cc",
+      "shell/common/asar/easar_v2.h",
+    ]
+  }
   if (is_win) {
     sources += filenames.lib_sources_win
   }
@@ -1391,6 +1435,25 @@ test("shell_browser_ui_unittests") {
     "//ui/base",
     "//ui/strings",
   ]
+}
+
+if (enable_easar_v2) {
+  test("shell_common_asar_unittests") {
+    sources = [
+      "//electron/shell/browser/ui/run_all_unittests.cc",
+      "//electron/shell/common/asar/archive_easar_v2_unittest.cc",
+      "//electron/shell/common/asar/scoped_temporary_file_unittest.cc",
+    ]
+
+    configs += [ ":electron_lib_config" ]
+
+    deps = [
+      ":electron_lib",
+      "//base",
+      "//base/test:test_support",
+      "//testing/gtest",
+    ]
+  }
 }
 
 template("dist_zip") {

@@ -48,6 +48,10 @@
 #include "ui/base/resource/resource_bundle.h"
 #include "ui/base/ui_base_switches.h"
 
+#if BUILDFLAG(ENABLE_EASR_V2)
+#include "shell/common/asar/archive.h"
+#endif
+
 #if BUILDFLAG(IS_MAC)
 #include "shell/app/electron_main_delegate_mac.h"
 #endif
@@ -228,7 +232,11 @@ std::string LoadResourceBundle(const std::string& locale) {
   return loaded_locale;
 }
 
-ElectronMainDelegate::ElectronMainDelegate() = default;
+ElectronMainDelegate::ElectronMainDelegate() {
+#if BUILDFLAG(ENABLE_EASR_V2)
+  asar::InstallEasrBuildPolicy();
+#endif
+}
 
 ElectronMainDelegate::~ElectronMainDelegate() = default;
 

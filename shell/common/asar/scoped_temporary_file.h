@@ -15,6 +15,19 @@ class File;
 
 namespace asar {
 
+#if BUILDFLAG(ENABLE_EASR_V2)
+// Creates the private per-process materialization directory and reclaims stale
+// directories left by processes that bypassed AtExit.
+bool PrepareTemporaryFileDirectory();
+
+// Test controls for isolating the process-global directory and exercising
+// concurrent stale-session reclamation. Callers must not hold materialized
+// files while resetting the state.
+void ResetTemporaryFileDirectoryForTesting();
+bool CleanupStaleTemporaryDirectoriesForTesting(const base::FilePath& parent);
+bool IsTemporaryLeasePrivateForTesting();
+#endif
+
 // An object representing a temporary file that should be cleaned up when this
 // object goes out of scope.  Note that since deletion occurs during the
 // destructor, no further error handling is possible if the directory fails to
@@ -29,12 +42,27 @@ class ScopedTemporaryFile {
   // Init an empty temporary file with a certain extension.
   bool Init(const base::FilePath::StringType& ext);
 
+#if BUILDFLAG(ENABLE_EASR_V2)
+  // Atomically creates the final temporary path and returns its still-open
+  // private handle. This avoids a create/reopen replacement window while
+  // authenticated bytes are being materialized. The caller must close the
+  // handle before exposing path().
+  bool InitForWrite(const base::FilePath::StringType& ext, base::File* file);
+#endif
+
   // Init an temporary file and fill it with content of |path|.
   bool InitFromFile(base::File* src,
                     const base::FilePath::StringType& ext,
                     uint64_t offset,
                     uint64_t size,
                     const absl::optional<IntegrityPayload>& integrity);
+
+#if BUILDFLAG(ENABLE_EASR_V2)
+  // Failure-only cleanup for files that have never been published. Writers
+  // must cleanse/truncate through their original handle before calling this;
+  // this method never reopens a path that an attacker could have replaced.
+  bool DeleteNow();
+#endif
 
   base::FilePath path() const { return path_; }
 

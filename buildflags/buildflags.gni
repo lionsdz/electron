@@ -31,4 +31,54 @@ declare_args() {
 
   # Enable Spellchecker support
   enable_builtin_spellchecker = true
+
+  # Build EASR v2 archives and install their key provider in every Electron
+  # process. This is deliberately opt-in: false keeps ordinary ASAR packaging
+  # and ordinary-ASAR runtime behavior fully compatible.
+  enable_easar_v2 = false
+
+  # Trusted build inputs. Key material is read from these files and is never
+  # accepted as a GN value or command-line byte string. The signing private key
+  # is used only by the pack action; only the data key and verification public
+  # key are emitted into the runtime key header.
+  easar_v2_data_key_file = ""
+  easar_v2_signing_private_key_file = ""
+  easar_v2_signing_public_key_file = ""
+
+  # Pure Node build actions cannot validate Windows ACLs. Windows production
+  # builds must explicitly acknowledge that the configured key files are
+  # protected by the CI/host ACL boundary.
+  easar_v2_trust_windows_key_acl = false
+
+  # Decimal uint64 rollback epoch. It is a string so all uint64 values remain
+  # exact in GN and JavaScript.
+  easar_v2_epoch = ""
+
+  # Reject ordinary ASAR only when both this and enable_easar_v2 are true.
+  easar_v2_require_encrypted = false
+
+  # 64 KiB chunks balance compact 16-byte tags with range-read granularity.
+  easar_v2_block_size_log2 = 16
+
+  # Maximum DEFLATE effort minimizes shipped bytes; decompression remains the
+  # same bounded per-chunk operation on the runtime hot path.
+  easar_v2_compression_level = 9
+  easar_v2_enable_compression = true
 }
+
+assert(!easar_v2_require_encrypted || enable_easar_v2,
+       "easar_v2_require_encrypted requires enable_easar_v2")
+assert(!enable_easar_v2 || easar_v2_data_key_file != "",
+       "enable_easar_v2 requires easar_v2_data_key_file")
+assert(!enable_easar_v2 || easar_v2_signing_private_key_file != "",
+       "enable_easar_v2 requires easar_v2_signing_private_key_file")
+assert(!enable_easar_v2 || easar_v2_signing_public_key_file != "",
+       "enable_easar_v2 requires easar_v2_signing_public_key_file")
+assert(!enable_easar_v2 || easar_v2_epoch != "",
+       "enable_easar_v2 requires an explicit easar_v2_epoch")
+assert(!enable_easar_v2 || host_os != "win" || easar_v2_trust_windows_key_acl,
+       "Windows EASR builds require easar_v2_trust_windows_key_acl=true")
+assert(easar_v2_block_size_log2 >= 12 && easar_v2_block_size_log2 <= 20,
+       "easar_v2_block_size_log2 must be between 12 and 20")
+assert(easar_v2_compression_level >= 1 && easar_v2_compression_level <= 9,
+       "easar_v2_compression_level must be between 1 and 9")

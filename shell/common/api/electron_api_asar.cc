@@ -2,17 +2,221 @@
 // Use of this source code is governed by the MIT license that can be
 // found in the LICENSE file.
 
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "base/bind.h"
+#include "base/task/thread_pool.h"
+#include "electron/buildflags/buildflags.h"
 #include "gin/handle.h"
 #include "shell/common/asar/archive.h"
 #include "shell/common/asar/asar_util.h"
 #include "shell/common/gin_converters/file_path_converter.h"
 #include "shell/common/gin_helper/dictionary.h"
+#include "shell/common/gin_helper/promise.h"
 #include "shell/common/node_includes.h"
 #include "shell/common/node_util.h"
+#if BUILDFLAG(ENABLE_EASR_V2)
+#include "third_party/boringssl/src/include/openssl/mem.h"
+#endif
 
 namespace {
+
+struct ReadFileStorage {
+#if BUILDFLAG(ENABLE_EASR_V2)
+  ~ReadFileStorage() {
+    if (secure && !contents.empty())
+      OPENSSL_cleanse(contents.data(), contents.size());
+  }
+
+  bool secure = false;
+#endif
+  std::string contents;
+};
+
+using OwnedReadFileStorage = std::unique_ptr<ReadFileStorage>;
+
+struct ReadFileResult {
+  ReadFileResult() = default;
+  ReadFileResult(ReadFileResult&&) noexcept = default;
+  ReadFileResult& operator=(ReadFileResult&&) noexcept = default;
+  ReadFileResult(const ReadFileResult&) = delete;
+  ReadFileResult& operator=(const ReadFileResult&) = delete;
+  ~ReadFileResult() = default;
+
+  OwnedReadFileStorage storage = std::make_unique<ReadFileStorage>();
+  base::FilePath archive_path;
+  base::FilePath file_path;
+  bool is_asar = true;
+  asar::Archive::Error error = asar::Archive::Error::kIo;
+};
+
+ReadFileResult ReadArchiveFile(std::shared_ptr<asar::Archive> archive,
+                               const base::FilePath& path) {
+  ReadFileResult result;
+  result.file_path = path;
+  if (!archive)
+    return result;
+  result.archive_path = archive->path();
+#if BUILDFLAG(ENABLE_EASR_V2)
+  result.storage->secure = archive->is_encrypted();
+#endif
+  archive->ReadFile(path, &result.storage->contents, node::Buffer::kMaxLength,
+                    &result.error);
+  return result;
+}
+
+ReadFileResult OpenAndReadPath(const base::FilePath& full_path) {
+  base::FilePath archive_path;
+  base::FilePath path;
+  if (!asar::GetAsarArchivePath(full_path, &archive_path, &path, true)) {
+    ReadFileResult result;
+    result.is_asar = false;
+    result.error = asar::Archive::Error::kNone;
+    return result;
+  }
+
+  asar::Archive::Error error = asar::Archive::Error::kIo;
+  std::shared_ptr<asar::Archive> archive =
+      asar::GetOrCreateAsarArchive(archive_path, &error);
+  if (!archive) {
+    ReadFileResult result;
+    result.archive_path = archive_path;
+    result.file_path = path;
+    result.error = error;
+    return result;
+  }
+  return ReadArchiveFile(std::move(archive), path);
+}
+
+void FreeReadFileBuffer(char*, void* hint) {
+  delete static_cast<ReadFileStorage*>(hint);
+}
+
+v8::Local<v8::Object> MakeReadFileBuffer(v8::Isolate* isolate,
+                                         OwnedReadFileStorage storage) {
+  if (!storage || storage->contents.empty())
+    return node::Buffer::New(isolate, 0).ToLocalChecked();
+  char* data = storage->contents.data();
+  const size_t size = storage->contents.size();
+  ReadFileStorage* hint = storage.release();
+  return node::Buffer::New(isolate, data, size, &FreeReadFileBuffer, hint)
+      .ToLocalChecked();
+}
+
+v8::Local<v8::Value> MakeArchiveError(v8::Isolate* isolate,
+                                      v8::Local<v8::Context> context,
+                                      asar::Archive::Error error,
+                                      const base::FilePath& archive_path,
+                                      const base::FilePath& path) {
+  const char* internal_code = asar::ArchiveErrorName(error);
+  const char* code = "EIO";
+  int error_number = -5;
+  if (error == asar::Archive::Error::kNotFound) {
+    code = "ENOENT";
+    error_number = -2;
+  } else if (error == asar::Archive::Error::kInvalidRange) {
+    code = "EINVAL";
+    error_number = -22;
+  }
+
+  std::string message = internal_code;
+  if (!path.empty())
+    message.append(": ").append(path.AsUTF8Unsafe());
+  message.append(" in ").append(archive_path.AsUTF8Unsafe());
+  v8::Local<v8::Object> exception =
+      v8::Exception::Error(
+          v8::String::NewFromUtf8(isolate, message.c_str()).ToLocalChecked())
+          .As<v8::Object>();
+  exception
+      ->Set(context, node::FIXED_ONE_BYTE_STRING(isolate, "code"),
+            node::OneByteString(isolate, code))
+      .Check();
+  exception
+      ->Set(context, node::FIXED_ONE_BYTE_STRING(isolate, "errno"),
+            v8::Integer::New(isolate, error_number))
+      .Check();
+  exception
+      ->Set(context, node::FIXED_ONE_BYTE_STRING(isolate, "easrError"),
+            v8::String::NewFromUtf8(isolate, internal_code).ToLocalChecked())
+      .Check();
+  exception
+      ->Set(context, node::FIXED_ONE_BYTE_STRING(isolate, "asarPath"),
+            gin::ConvertToV8(isolate, archive_path))
+      .Check();
+  if (!path.empty()) {
+    exception
+        ->Set(context, node::FIXED_ONE_BYTE_STRING(isolate, "filePath"),
+              gin::ConvertToV8(isolate, path))
+        .Check();
+    exception
+        ->Set(context, node::FIXED_ONE_BYTE_STRING(isolate, "path"),
+              gin::ConvertToV8(isolate, archive_path.Append(path)))
+        .Check();
+  }
+  return exception;
+}
+
+void FinishReadArchiveFile(gin_helper::Promise<v8::Local<v8::Value>> promise,
+                           ReadFileResult result) {
+  v8::Isolate* isolate = promise.isolate();
+  v8::HandleScope handle_scope(isolate);
+  if (isolate->IsExecutionTerminating())
+    return;
+  v8::Local<v8::Context> context = promise.GetContext();
+  if (node::Environment::GetCurrent(context) == nullptr)
+    return;
+  v8::Context::Scope context_scope(context);
+  if (!result.is_asar) {
+    promise.Resolve(v8::Undefined(isolate));
+    return;
+  }
+  if (result.error != asar::Archive::Error::kNone) {
+    promise.Reject(MakeArchiveError(isolate, context, result.error,
+                                    result.archive_path, result.file_path));
+    return;
+  }
+  promise.Resolve(MakeReadFileBuffer(isolate, std::move(result.storage)));
+}
+
+v8::Local<v8::Promise> StartReadArchiveFile(
+    v8::Isolate* isolate,
+    std::shared_ptr<asar::Archive> archive,
+    const base::FilePath& path) {
+  gin_helper::Promise<v8::Local<v8::Value>> promise(isolate);
+  v8::Local<v8::Promise> handle = promise.GetHandle();
+  base::ThreadPool::PostTaskAndReplyWithResult(
+      FROM_HERE,
+      {base::MayBlock(), base::WithBaseSyncPrimitives(),
+       base::TaskPriority::USER_VISIBLE,
+       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
+      base::BindOnce(&ReadArchiveFile, std::move(archive), path),
+      base::BindOnce(&FinishReadArchiveFile, std::move(promise)));
+  return handle;
+}
+
+void ReadFileAsync(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  base::FilePath full_path;
+  if (!gin::ConvertFromV8(isolate, args[0], &full_path)) {
+    isolate->ThrowException(v8::Exception::TypeError(
+        node::FIXED_ONE_BYTE_STRING(isolate, "invalid ASAR path")));
+    return;
+  }
+
+  gin_helper::Promise<v8::Local<v8::Value>> promise(isolate);
+  v8::Local<v8::Promise> handle = promise.GetHandle();
+  base::ThreadPool::PostTaskAndReplyWithResult(
+      FROM_HERE,
+      {base::MayBlock(), base::WithBaseSyncPrimitives(),
+       base::TaskPriority::USER_VISIBLE,
+       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
+      base::BindOnce(&OpenAndReadPath, full_path),
+      base::BindOnce(&FinishReadArchiveFile, std::move(promise)));
+  args.GetReturnValue().Set(handle);
+}
 
 class Archive : public node::ObjectWrap {
  public:
@@ -28,6 +232,8 @@ class Archive : public node::ObjectWrap {
     NODE_SET_PROTOTYPE_METHOD(tpl, "readdir", &Archive::Readdir);
     NODE_SET_PROTOTYPE_METHOD(tpl, "realpath", &Archive::Realpath);
     NODE_SET_PROTOTYPE_METHOD(tpl, "copyFileOut", &Archive::CopyFileOut);
+    NODE_SET_PROTOTYPE_METHOD(tpl, "readFile", &Archive::ReadFile);
+    NODE_SET_PROTOTYPE_METHOD(tpl, "readFileAsync", &Archive::ReadFileAsync);
     NODE_SET_PROTOTYPE_METHOD(tpl, "getFdAndValidateIntegrityLater",
                               &Archive::GetFD);
 
@@ -52,10 +258,13 @@ class Archive : public node::ObjectWrap {
       return;
     }
 
-    std::shared_ptr<asar::Archive> archive = asar::GetOrCreateAsarArchive(path);
+    asar::Archive::Error error = asar::Archive::Error::kIo;
+    std::shared_ptr<asar::Archive> archive =
+        asar::GetOrCreateAsarArchive(path, &error);
     if (!archive) {
-      isolate->ThrowException(v8::Exception::Error(node::FIXED_ONE_BYTE_STRING(
-          isolate, "failed to initialize archive")));
+      isolate->ThrowException(MakeArchiveError(isolate,
+                                               isolate->GetCurrentContext(),
+                                               error, path, base::FilePath()));
       return;
     }
 
@@ -174,11 +383,76 @@ class Archive : public node::ObjectWrap {
     }
 
     base::FilePath new_path;
-    if (!wrap->archive_ || !wrap->archive_->CopyFileOut(path, &new_path)) {
+    asar::Archive::Error error = asar::Archive::Error::kIo;
+    if (!wrap->archive_ ||
+        !wrap->archive_->CopyFileOut(path, &new_path, &error)) {
+      if (error != asar::Archive::Error::kNotFound) {
+        isolate->ThrowException(MakeArchiveError(
+            isolate, isolate->GetCurrentContext(), error,
+            wrap->archive_ ? wrap->archive_->path() : base::FilePath(), path));
+        return;
+      }
       args.GetReturnValue().Set(v8::False(isolate));
       return;
     }
     args.GetReturnValue().Set(gin::ConvertToV8(isolate, new_path));
+  }
+
+  // Read file contents and return a Buffer.
+  static void ReadFile(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    auto* isolate = args.GetIsolate();
+    auto* wrap = node::ObjectWrap::Unwrap<Archive>(args.Holder());
+    base::FilePath path;
+    if (!gin::ConvertFromV8(isolate, args[0], &path)) {
+      args.GetReturnValue().Set(v8::False(isolate));
+      return;
+    }
+
+    OwnedReadFileStorage storage = std::make_unique<ReadFileStorage>();
+    asar::Archive::Error error = asar::Archive::Error::kIo;
+    asar::Archive::FileInfo info;
+    if (wrap->archive_ && wrap->archive_->GetFileInfo(path, &info) &&
+        info.size > node::Buffer::kMaxLength) {
+      isolate->ThrowException(
+          MakeArchiveError(isolate, isolate->GetCurrentContext(),
+                           asar::Archive::Error::kResourceExhausted,
+                           wrap->archive_->path(), path));
+      return;
+    }
+#if BUILDFLAG(ENABLE_EASR_V2)
+    if (wrap->archive_)
+      storage->secure = wrap->archive_->is_encrypted();
+#endif
+    if (!wrap->archive_ ||
+        !wrap->archive_->ReadFile(path, &storage->contents, &error)) {
+      if (error != asar::Archive::Error::kNotFound) {
+        isolate->ThrowException(MakeArchiveError(
+            isolate, isolate->GetCurrentContext(), error,
+            wrap->archive_ ? wrap->archive_->path() : base::FilePath(), path));
+        return;
+      }
+      args.GetReturnValue().Set(v8::False(isolate));
+      return;
+    }
+
+    args.GetReturnValue().Set(MakeReadFileBuffer(isolate, std::move(storage)));
+  }
+
+  // Read/decrypt/decompress on a worker and create the Buffer only after the
+  // reply returns to this isolate's sequence.
+  static void ReadFileAsync(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    auto* isolate = args.GetIsolate();
+    auto* wrap = node::ObjectWrap::Unwrap<Archive>(args.Holder());
+    base::FilePath path;
+    if (!gin::ConvertFromV8(isolate, args[0], &path)) {
+      isolate->ThrowException(v8::Exception::TypeError(
+          node::FIXED_ONE_BYTE_STRING(isolate, "invalid ASAR path")));
+      return;
+    }
+
+    std::shared_ptr<asar::Archive> archive = wrap->archive_;
+    args.GetReturnValue().Set(
+        StartReadArchiveFile(isolate, std::move(archive), path));
   }
 
   // Return the file descriptor.
@@ -241,6 +515,7 @@ void Initialize(v8::Local<v8::Object> exports,
   exports->Set(context, node::FIXED_ONE_BYTE_STRING(isolate, "Archive"), cons)
       .Check();
   NODE_SET_METHOD(exports, "splitPath", &SplitPath);
+  NODE_SET_METHOD(exports, "readFileAsync", &ReadFileAsync);
   NODE_SET_METHOD(exports, "initAsarSupport", &InitAsarSupport);
 }
 

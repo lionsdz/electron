@@ -34,6 +34,9 @@
 #include "shell/app/command_line_args.h"
 #include "shell/app/electron_main_delegate.h"
 #include "shell/app/node_main.h"
+#if BUILDFLAG(ENABLE_EASR_V2)
+#include "shell/common/asar/archive.h"
+#endif
 #include "shell/common/electron_command_line.h"
 #include "shell/common/electron_constants.h"
 #include "third_party/crashpad/crashpad/util/win/initial_client_data.h"
@@ -168,6 +171,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmd, int) {
   if (electron::fuses::IsRunAsNodeEnabled() && run_as_node) {
     base::AtExitManager atexit_manager;
     base::i18n::InitializeICU();
+#if BUILDFLAG(ENABLE_EASR_V2)
+    asar::InstallEasrBuildPolicy();
+#endif
     auto ret = electron::NodeMain(argv.size(), argv.data());
     std::for_each(argv.begin(), argv.end(), free);
     return ret;

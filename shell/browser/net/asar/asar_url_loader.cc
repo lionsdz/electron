@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "base/numerics/safe_conversions.h"
 #include "base/strings/stringprintf.h"
 #include "base/task/thread_pool.h"
 #include "content/public/browser/file_url_loader.h"
@@ -27,6 +28,9 @@
 #include "shell/browser/net/asar/asar_file_validator.h"
 #include "shell/common/asar/archive.h"
 #include "shell/common/asar/asar_util.h"
+#if BUILDFLAG(ENABLE_EASR_V2)
+#include "third_party/boringssl/src/include/openssl/mem.h"
+#endif
 
 namespace asar {
 
@@ -55,6 +59,78 @@ constexpr size_t kDefaultFileUrlPipeSize = 65536;
 static_assert(kDefaultFileUrlPipeSize >= net::kMaxBytesToSniff,
               "Default file data pipe size must be at least as large as a MIME-"
               "type sniffing buffer.");
+
+#if BUILDFLAG(ENABLE_EASR_V2)
+class ScopedEncryptedReadBufferCleanse {
+ public:
+  ScopedEncryptedReadBufferCleanse(std::vector<char>* buffer, bool encrypted)
+      : buffer_(encrypted ? buffer : nullptr) {}
+  ScopedEncryptedReadBufferCleanse(const ScopedEncryptedReadBufferCleanse&) =
+      delete;
+  ScopedEncryptedReadBufferCleanse& operator=(
+      const ScopedEncryptedReadBufferCleanse&) = delete;
+  ~ScopedEncryptedReadBufferCleanse() {
+    if (buffer_ && !buffer_->empty())
+      OPENSSL_cleanse(buffer_->data(), buffer_->size());
+  }
+
+ private:
+  std::vector<char>* buffer_;
+};
+
+class EncryptedAsarDataSource final
+    : public mojo::DataPipeProducer::DataSource {
+ public:
+  EncryptedAsarDataSource(std::shared_ptr<Archive> archive,
+                          Archive::FileInfo info)
+      : archive_(std::move(archive)),
+        info_(std::move(info)),
+        start_offset_(0),
+        end_offset_(info_.size) {}
+
+  EncryptedAsarDataSource(const EncryptedAsarDataSource&) = delete;
+  EncryptedAsarDataSource& operator=(const EncryptedAsarDataSource&) = delete;
+  ~EncryptedAsarDataSource() override = default;
+
+  void SetRange(uint64_t start, uint64_t end) {
+    start_offset_ = start;
+    end_offset_ = end;
+  }
+
+ private:
+  uint64_t GetLength() const override {
+    if (end_offset_ < start_offset_)
+      return 0;
+    return end_offset_ - start_offset_;
+  }
+
+  ReadResult Read(uint64_t offset, base::span<char> buffer) override {
+    ReadResult result;
+    if (offset > GetLength()) {
+      result.result = MOJO_RESULT_OUT_OF_RANGE;
+      return result;
+    }
+
+    size_t readable_size = base::saturated_cast<size_t>(GetLength() - offset);
+    size_t copyable_size = std::min(readable_size, buffer.size());
+    if (copyable_size == 0)
+      return result;
+
+    if (!archive_->ReadRange(info_, start_offset_ + offset,
+                             buffer.first(copyable_size))) {
+      result.result = MOJO_RESULT_FAILED_PRECONDITION;
+      return result;
+    }
+    result.bytes_read = copyable_size;
+    return result;
+  }
+
+  std::shared_ptr<Archive> archive_;
+  Archive::FileInfo info_;
+  uint64_t start_offset_;
+  uint64_t end_offset_;
+};
+#endif  // BUILDFLAG(ENABLE_EASR_V2)
 
 // Modified from the |FileURLLoader| in |file_url_loader_factory.cc|, to serve
 // asar files instead of normal files.
@@ -134,11 +210,17 @@ class AsarURLLoader : public network::mojom::URLLoader {
       return;
     }
     bool is_verifying_file = info.integrity.has_value();
+#if BUILDFLAG(ENABLE_EASR_V2)
+    is_verifying_file = is_verifying_file && !archive->is_encrypted();
+#endif
 
     // For unpacked path, read like normal file.
     base::FilePath real_path;
     if (info.unpacked) {
-      archive->CopyFileOut(relative_path, &real_path);
+      if (!archive->CopyFileOut(relative_path, &real_path)) {
+        OnClientComplete(net::ERR_FAILED);
+        return;
+      }
       info.offset = 0;
     }
 
@@ -153,29 +235,53 @@ class AsarURLLoader : public network::mojom::URLLoader {
     // Note that while the |Archive| already opens a |base::File|, we still need
     // to create a new |base::File| here, as it might be accessed by multiple
     // requests at the same time.
-    base::File file(info.unpacked ? real_path : archive->path(),
-                    base::File::FLAG_OPEN | base::File::FLAG_READ);
-    auto file_data_source =
-        std::make_unique<mojo::FileDataSource>(file.Duplicate());
     std::unique_ptr<mojo::DataPipeProducer::DataSource> readable_data_source;
-    mojo::FileDataSource* file_data_source_raw = file_data_source.get();
+    mojo::FileDataSource* file_data_source_raw = nullptr;
+#if BUILDFLAG(ENABLE_EASR_V2)
+    EncryptedAsarDataSource* encrypted_data_source_raw = nullptr;
+#endif
     AsarFileValidator* file_validator_raw = nullptr;
     uint32_t block_size = 0;
-    if (info.integrity.has_value()) {
-      block_size = info.integrity.value().block_size;
-      auto asar_validator = std::make_unique<AsarFileValidator>(
-          std::move(info.integrity.value()), std::move(file));
-      file_validator_raw = asar_validator.get();
-      readable_data_source.reset(new mojo::FilteredDataSource(
-          std::move(file_data_source), std::move(asar_validator)));
-    } else {
-      readable_data_source = std::move(file_data_source);
+    base::File file;
+#if BUILDFLAG(ENABLE_EASR_V2)
+    if (archive->is_encrypted() && !info.unpacked) {
+      auto encrypted_data_source =
+          std::make_unique<EncryptedAsarDataSource>(archive, info);
+      encrypted_data_source_raw = encrypted_data_source.get();
+      readable_data_source = std::move(encrypted_data_source);
+    } else
+#endif
+    {
+      file.Initialize(info.unpacked ? real_path : archive->path(),
+                      base::File::FLAG_OPEN | base::File::FLAG_READ);
+      auto file_data_source =
+          std::make_unique<mojo::FileDataSource>(file.Duplicate());
+      file_data_source_raw = file_data_source.get();
+      if (info.integrity.has_value()) {
+        block_size = info.integrity.value().block_size;
+        auto asar_validator = std::make_unique<AsarFileValidator>(
+            std::move(info.integrity.value()), std::move(file));
+        file_validator_raw = asar_validator.get();
+        readable_data_source.reset(new mojo::FilteredDataSource(
+            std::move(file_data_source), std::move(asar_validator)));
+      } else {
+        readable_data_source = std::move(file_data_source);
+      }
     }
 
-    std::vector<char> initial_read_buffer(
-        std::min(static_cast<uint32_t>(net::kMaxBytesToSniff), info.size));
+    std::vector<char> initial_read_buffer(static_cast<size_t>(
+        std::min<uint64_t>(net::kMaxBytesToSniff, info.size)));
+#if BUILDFLAG(ENABLE_EASR_V2)
+    ScopedEncryptedReadBufferCleanse initial_read_cleanse(
+        &initial_read_buffer, archive->is_encrypted());
+#endif
+    uint64_t initial_read_offset = info.offset;
+#if BUILDFLAG(ENABLE_EASR_V2)
+    if (archive->is_encrypted())
+      initial_read_offset = 0;
+#endif
     auto read_result = readable_data_source.get()->Read(
-        info.offset, base::span<char>(initial_read_buffer));
+        initial_read_offset, base::span<char>(initial_read_buffer));
     if (read_result.result != MOJO_RESULT_OK) {
       OnClientComplete(ConvertMojoResultToNetError(read_result.result));
       return;
@@ -323,9 +429,17 @@ class AsarURLLoader : public network::mojom::URLLoader {
     // (i.e., no range request) this Seek is effectively a no-op.
     //
     // Note that in Electron we also need to add file offset.
-    file_data_source_raw->SetRange(
-        first_byte_to_send + info.offset,
-        first_byte_to_send + info.offset + total_bytes_to_send);
+#if BUILDFLAG(ENABLE_EASR_V2)
+    if (encrypted_data_source_raw) {
+      encrypted_data_source_raw->SetRange(
+          first_byte_to_send, first_byte_to_send + total_bytes_to_send);
+    } else
+#endif
+    {
+      file_data_source_raw->SetRange(
+          first_byte_to_send + info.offset,
+          first_byte_to_send + info.offset + total_bytes_to_send);
+    }
     if (file_validator_raw)
       file_validator_raw->SetRange(info.offset + first_byte_to_send,
                                    total_bytes_dropped_from_head,

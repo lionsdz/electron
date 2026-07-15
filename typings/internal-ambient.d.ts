@@ -6,11 +6,12 @@ declare var isolatedApi: {
   guestViewInternal: any;
   allowGuestViewElementDefinition: NodeJS.InternalWebFrame['allowGuestViewElementDefinition'];
   setIsWebView: (iframe: HTMLIFrameElement) => void;
-}
+};
 
 declare const BUILDFLAG: (flag: boolean) => boolean;
 
 declare const ENABLE_DESKTOP_CAPTURER: boolean;
+declare const ENABLE_EASR_V2: boolean;
 declare const ENABLE_VIEWS_API: boolean;
 
 declare namespace NodeJS {
@@ -78,11 +79,14 @@ declare namespace NodeJS {
     readdir(path: string): string[] | false;
     realpath(path: string): string | false;
     copyFileOut(path: string): string | false;
+    readFile(path: string): Buffer | false;
+    readFileAsync(path: string): Promise<Buffer>;
     getFdAndValidateIntegrityLater(): number | -1;
   }
 
   interface AsarBinding {
     Archive: { new(path: string): AsarArchive };
+    readFileAsync(path: string): Promise<Buffer | undefined>;
     splitPath(path: string): {
       isAsar: false;
     } | {
