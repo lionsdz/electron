@@ -447,6 +447,7 @@ source_set("electron_lib") {
     "//content/public/gpu",
     "//content/public/renderer",
     "//content/public/utility",
+    "//crypto",
     "//device/bluetooth",
     "//device/bluetooth/public/cpp",
     "//gin",

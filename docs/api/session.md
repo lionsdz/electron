@@ -982,6 +982,40 @@ will be temporary.
 
 Returns `string` - The user agent for this session.
 
+#### `ses.setFingerprint(fingerprint)`
+
+* `fingerprint` string
+
+Overrides the Chromium fingerprint seed for this session. Pass an empty string
+to reset it to the session default. The seed may contain Unicode and is limited
+to 1024 bytes after UTF-8 encoding.
+
+The fingerprint profile becomes immutable when the first renderer for the
+session starts or the first profiled `Device-Memory` client hint is sent.
+Calling this method after either point throws an error, including when the
+supplied value matches the current value. Configure the fingerprint before
+creating a `BrowserWindow`, `WebContents`, worker, or other renderer or request
+that uses this session.
+
+Electron never places this string on a child-process command line. It derives a
+fixed-size token with HMAC-SHA-256 and sends only that token. Persistent
+sessions keep their random HMAC secret in a dedicated versioned file. On first
+use, Electron serializes initialization across processes, atomically writes and
+flushes the file, and verifies an exact readback before allowing a renderer to
+use the profile. A lock, permission, write, flush, or verification failure is
+fail-closed: no temporary persona or renderer token is substituted. In-memory
+sessions use a random secret that exists only for that browser context's
+lifetime. Fingerprint profiles do not support Electron's `--single-process`
+mode because one process-wide Blink snapshot cannot safely represent multiple
+sessions.
+
+#### `ses.getFingerprint()`
+
+Returns `string` - The configured seed, or the public session fallback
+(`default`, `memory:<partition>`, or `persist:<partition>`) when no explicit
+seed is configured. This method never returns the random secret or derived
+renderer token.
+
 #### `ses.setSSLConfig(config)`
 
 * `config` Object

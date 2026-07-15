@@ -737,6 +737,38 @@ std::string Session::GetUserAgent() {
   return browser_context_->GetUserAgent();
 }
 
+void Session::SetFingerprint(const std::string& fingerprint,
+                             gin::Arguments* args) {
+  if (!base::IsStringUTF8(fingerprint)) {
+    args->ThrowTypeError("fingerprint must be valid UTF-8");
+    return;
+  }
+  if (fingerprint.size() > ElectronBrowserContext::kMaxFingerprintSeedBytes) {
+    args->ThrowTypeError("fingerprint must not exceed 1024 UTF-8 bytes");
+    return;
+  }
+  switch (browser_context_->SetFingerprint(fingerprint)) {
+    case ElectronBrowserContext::SetFingerprintResult::kSuccess:
+      return;
+    case ElectronBrowserContext::SetFingerprintResult::kLocked:
+      gin_helper::ErrorThrower(args->isolate())
+          .ThrowError(
+              "fingerprint is immutable after a renderer has started or a "
+              "Device-Memory client hint has been sent");
+      return;
+    case ElectronBrowserContext::SetFingerprintResult::kUnavailable:
+      gin_helper::ErrorThrower(args->isolate())
+          .ThrowError(
+              "fingerprint profile is unavailable because its "
+              "persistent secret could not be initialized");
+      return;
+  }
+}
+
+std::string Session::GetFingerprint() {
+  return browser_context_->GetFingerprint();
+}
+
 void Session::SetSSLConfig(network::mojom::SSLConfigPtr config) {
   browser_context_->SetSSLConfig(std::move(config));
 }
@@ -1239,6 +1271,8 @@ gin::ObjectTemplateBuilder Session::GetObjectTemplateBuilder(
       .SetMethod("isPersistent", &Session::IsPersistent)
       .SetMethod("setUserAgent", &Session::SetUserAgent)
       .SetMethod("getUserAgent", &Session::GetUserAgent)
+      .SetMethod("setFingerprint", &Session::SetFingerprint)
+      .SetMethod("getFingerprint", &Session::GetFingerprint)
       .SetMethod("setSSLConfig", &Session::SetSSLConfig)
       .SetMethod("getBlobData", &Session::GetBlobData)
       .SetMethod("downloadURL", &Session::DownloadURL)

@@ -5,6 +5,10 @@
 #ifndef ELECTRON_SHELL_BROWSER_ELECTRON_BROWSER_CONTEXT_H_
 #define ELECTRON_SHELL_BROWSER_ELECTRON_BROWSER_CONTEXT_H_
 
+#include <stddef.h>
+#include <stdint.h>
+
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
@@ -68,6 +72,14 @@ using DisplayMediaRequestHandler =
 
 class ElectronBrowserContext : public content::BrowserContext {
  public:
+  static constexpr size_t kMaxFingerprintSeedBytes = 1024;
+
+  enum class SetFingerprintResult {
+    kSuccess,
+    kLocked,
+    kUnavailable,
+  };
+
   // disable copy
   ElectronBrowserContext(const ElectronBrowserContext&) = delete;
   ElectronBrowserContext& operator=(const ElectronBrowserContext&) = delete;
@@ -132,6 +144,7 @@ class ElectronBrowserContext : public content::BrowserContext {
   storage::SpecialStoragePolicy* GetSpecialStoragePolicy() override;
   content::ClientHintsControllerDelegate* GetClientHintsControllerDelegate()
       override;
+  absl::optional<uint32_t> GetDeviceMemoryClientHintProfile() override;
   content::StorageNotificationService* GetStorageNotificationService() override;
   content::ReduceAcceptLanguageControllerDelegate*
   GetReduceAcceptLanguageControllerDelegate() override;
@@ -143,6 +156,14 @@ class ElectronBrowserContext : public content::BrowserContext {
   ValueMapPrefStore* in_memory_pref_store() const {
     return in_memory_pref_store_.get();
   }
+  const std::string& partition() const { return partition_; }
+  std::string GetFingerprint() const;
+  SetFingerprintResult SetFingerprint(const std::string& fingerprint);
+  static uint64_t GetFingerprintIgnoredDomainMask();
+  // Locks the profile for this BrowserContext and returns the only value that
+  // is propagated to a renderer. The returned token never contains the public
+  // seed or the persistent secret.
+  const std::string& GetFingerprintTokenForRenderer();
   base::WeakPtr<ElectronBrowserContext> GetWeakPtr() {
     return weak_factory_.GetWeakPtr();
   }
@@ -201,6 +222,8 @@ class ElectronBrowserContext : public content::BrowserContext {
 
   // Initialize pref registry.
   void InitPrefs();
+  void InitFingerprintSecret();
+  void UpdateFingerprintToken();
 
   bool DoesDeviceMatch(const base::Value& device,
                        const base::Value* device_to_compare,
@@ -220,6 +243,14 @@ class ElectronBrowserContext : public content::BrowserContext {
   std::unique_ptr<ProtocolRegistry> protocol_registry_;
 
   absl::optional<std::string> user_agent_;
+  std::string partition_;
+  std::string fingerprint_;
+  std::array<uint8_t, 32> fingerprint_secret_{};
+  std::string fingerprint_token_;
+  absl::optional<uint32_t> device_memory_client_hint_profile_;
+  std::string fingerprint_initialization_error_;
+  bool fingerprint_ready_ = false;
+  bool fingerprint_locked_ = false;
   base::FilePath path_;
   bool in_memory_ = false;
   bool use_cache_ = true;

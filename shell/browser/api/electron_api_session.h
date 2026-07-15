@@ -112,6 +112,8 @@ class Session : public gin::Wrappable<Session>,
   void AllowNTLMCredentialsForDomains(const std::string& domains);
   void SetUserAgent(const std::string& user_agent, gin::Arguments* args);
   std::string GetUserAgent();
+  void SetFingerprint(const std::string& fingerprint, gin::Arguments* args);
+  std::string GetFingerprint();
   void SetSSLConfig(network::mojom::SSLConfigPtr config);
   bool IsPersistent();
   v8::Local<v8::Promise> GetBlobData(v8::Isolate* isolate,

@@ -19,6 +19,7 @@
 #include "base/json/json_reader.h"
 #include "base/lazy_instance.h"
 #include "base/no_destructor.h"
+#include "base/noise_generator.h"
 #include "base/path_service.h"
 #include "base/stl_util.h"
 #include "base/strings/escape.h"
@@ -542,6 +543,10 @@ void ElectronBrowserClient::AppendExtraCommandLineSwitches(
   }
 
   if (process_type == ::switches::kRendererProcess) {
+    CHECK(!content::RenderProcessHost::run_renderer_in_process())
+        << "Fingerprint profiles require renderer process isolation";
+    command_line->AppendSwitch(
+        FingerprintProfile::kFingerprintTokenRequiredSwitch);
 #if BUILDFLAG(IS_WIN)
     // Append --app-user-model-id.
     PWSTR current_app_id;
@@ -562,13 +567,26 @@ void ElectronBrowserClient::AppendExtraCommandLineSwitches(
       command_line->AppendSwitch("profile-electron-init");
     }
 
+    content::RenderProcessHost* process =
+        content::RenderProcessHost::FromID(process_id);
+    CHECK(process && process->GetBrowserContext())
+        << "Renderer process has no fingerprint BrowserContext";
+    auto* browser_context =
+        static_cast<ElectronBrowserContext*>(process->GetBrowserContext());
+    command_line->AppendSwitchASCII(
+        FingerprintProfile::kFingerprintTokenSwitch,
+        browser_context->GetFingerprintTokenForRenderer());
+
+    command_line->AppendSwitchASCII(
+        FingerprintProfile::kFingerprintIgnoreMaskSwitch,
+        base::NumberToString(
+            ElectronBrowserContext::GetFingerprintIgnoredDomainMask()));
+
     // Extension background pages don't have WebContentsPreferences, but they
     // support WebSQL by default.
 #if BUILDFLAG(ENABLE_ELECTRON_EXTENSIONS)
-    content::RenderProcessHost* process =
-        content::RenderProcessHost::FromID(process_id);
-    if (extensions::ProcessMap::Get(process->GetBrowserContext())
-            ->Contains(process_id))
+    if (process && extensions::ProcessMap::Get(process->GetBrowserContext())
+                       ->Contains(process_id))
       command_line->AppendSwitch(switches::kEnableWebSQL);
 #endif
 

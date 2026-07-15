@@ -4,16 +4,21 @@
 
 #include "shell/browser/electron_browser_context.h"
 
+#include <array>
 #include <memory>
-
 #include <utility>
 
 #include "base/barrier_closure.h"
 #include "base/base_paths.h"
+#include "base/check.h"
 #include "base/command_line.h"
 #include "base/files/file_path.h"
+#include "base/fingerprint_secret_store.h"
+#include "base/logging.h"
 #include "base/no_destructor.h"
+#include "base/noise_generator.h"
 #include "base/path_service.h"
+#include "base/rand_util.h"
 #include "base/strings/escape.h"
 #include "base/strings/string_util.h"
 #include "base/threading/sequenced_task_runner_handle.h"
@@ -35,6 +40,8 @@
 #include "content/public/browser/shared_cors_origin_access_list.h"
 #include "content/public/browser/storage_partition.h"
 #include "content/public/browser/web_contents_media_capture_id.h"
+#include "content/public/common/content_switches.h"
+#include "crypto/hmac.h"
 #include "media/audio/audio_device_description.h"
 #include "services/network/public/cpp/features.h"
 #include "services/network/public/cpp/wrapper_shared_url_loader_factory.h"
@@ -57,6 +64,7 @@
 #include "shell/common/gin_helper/error_thrower.h"
 #include "shell/common/options_switches.h"
 #include "third_party/blink/public/mojom/mediastream/media_stream.mojom.h"
+#include "third_party/boringssl/src/include/openssl/mem.h"
 
 #if BUILDFLAG(ENABLE_ELECTRON_EXTENSIONS)
 #include "extensions/browser/browser_context_keyed_service_factories.h"
@@ -91,6 +99,26 @@ namespace electron {
 
 namespace {
 
+constexpr char kFingerprintTokenContext[] =
+    "electron-fingerprint-profile-token-v1";
+
+const FingerprintProfile::IgnoredDomains& GetFingerprintIgnoredDomains() {
+  static const FingerprintProfile::IgnoredDomains ignored_domains = [] {
+    FingerprintProfile::IgnoredDomains result;
+    const base::CommandLine* command_line =
+        base::CommandLine::ForCurrentProcess();
+    if (command_line->HasSwitch(
+            FingerprintProfile::kFingerprintIgnoresSwitch)) {
+      FingerprintProfile::ParseIgnoredDomains(
+          command_line->GetSwitchValueASCII(
+              FingerprintProfile::kFingerprintIgnoresSwitch),
+          &result);
+    }
+    return result;
+  }();
+  return ignored_domains;
+}
+
 // Convert string to lower case and escape it.
 std::string MakePartitionName(const std::string& input) {
   return base::EscapePath(base::ToLowerASCII(input));
@@ -112,10 +140,16 @@ ElectronBrowserContext::ElectronBrowserContext(const std::string& partition,
     : in_memory_pref_store_(new ValueMapPrefStore),
       storage_policy_(base::MakeRefCounted<SpecialStoragePolicy>()),
       protocol_registry_(base::WrapUnique(new ProtocolRegistry)),
+      partition_(partition),
       in_memory_(in_memory),
       ssl_config_(network::mojom::SSLConfig::New()) {
-  // Read options.
   base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
+  CHECK(!command_line->HasSwitch(::switches::kSingleProcess) &&
+        !content::RenderProcessHost::run_renderer_in_process())
+      << "Fingerprint profiles require renderer process isolation; "
+         "Electron does not support --single-process with this feature";
+
+  // Read options.
   use_cache_ = !command_line->HasSwitch(switches::kDisableHttpCache);
   if (auto use_cache_opt = options.FindBool("cache")) {
     use_cache_ = use_cache_opt.value();
@@ -125,18 +159,17 @@ ElectronBrowserContext::ElectronBrowserContext(const std::string& partition,
                     &max_cache_size_);
 
   base::PathService::Get(DIR_SESSION_DATA, &path_);
-  if (!in_memory && !partition.empty()){
+  if (!in_memory && !partition.empty()) {
     path_ = path_.Append(FILE_PATH_LITERAL("Partitions"))
                 .Append(base::FilePath::FromUTF8Unsafe(
                     MakePartitionName(partition)));
-        // 动态添加 partition 参数到启动命令行
-       command_line->AppendSwitchASCII("partition", partition);
-    }
+  }
 
   BrowserContextDependencyManager::GetInstance()->MarkBrowserContextLive(this);
 
   // Initialize Pref Registry.
   InitPrefs();
+  InitFingerprintSecret();
 
   cookie_change_notifier_ = std::make_unique<CookieChangeNotifier>(this);
 
@@ -155,6 +188,7 @@ ElectronBrowserContext::ElectronBrowserContext(const std::string& partition,
 
 ElectronBrowserContext::~ElectronBrowserContext() {
   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  OPENSSL_cleanse(fingerprint_secret_.data(), fingerprint_secret_.size());
   NotifyWillBeDestroyed();
   // Notify any keyed services of browser context destruction.
   BrowserContextDependencyManager::GetInstance()->DestroyBrowserContextServices(
@@ -247,6 +281,102 @@ base::FilePath ElectronBrowserContext::GetPath() {
 
 bool ElectronBrowserContext::IsOffTheRecord() {
   return in_memory_;
+}
+
+std::string ElectronBrowserContext::GetFingerprint() const {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  if (!fingerprint_.empty())
+    return fingerprint_;
+  if (partition_.empty())
+    return "default";
+  return (in_memory_ ? "memory:" : "persist:") + partition_;
+}
+
+ElectronBrowserContext::SetFingerprintResult
+ElectronBrowserContext::SetFingerprint(const std::string& fingerprint) {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  DCHECK(base::IsStringUTF8(fingerprint));
+  DCHECK_LE(fingerprint.size(), kMaxFingerprintSeedBytes);
+  if (!fingerprint_ready_)
+    return SetFingerprintResult::kUnavailable;
+  if (fingerprint_locked_)
+    return SetFingerprintResult::kLocked;
+  fingerprint_ = fingerprint;
+  UpdateFingerprintToken();
+  return SetFingerprintResult::kSuccess;
+}
+
+// static
+uint64_t ElectronBrowserContext::GetFingerprintIgnoredDomainMask() {
+  return GetFingerprintIgnoredDomains().ToEnumBitmask();
+}
+
+const std::string& ElectronBrowserContext::GetFingerprintTokenForRenderer() {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  CHECK(fingerprint_ready_)
+      << "Refusing to start a renderer without a durable fingerprint secret: "
+      << fingerprint_initialization_error_;
+  fingerprint_locked_ = true;
+  return fingerprint_token_;
+}
+
+void ElectronBrowserContext::InitFingerprintSecret() {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  if (in_memory_) {
+    base::RandBytes(fingerprint_secret_.data(), fingerprint_secret_.size());
+    fingerprint_ready_ = true;
+    UpdateFingerprintToken();
+    return;
+  }
+
+  base::ThreadRestrictions::ScopedAllowIO allow_io;
+  auto result = base::FingerprintSecretStore::LoadOrCreate(path_);
+  if (!result.ok()) {
+    fingerprint_initialization_error_ =
+        base::FingerprintSecretStore::StatusToString(result.status);
+    LOG(ERROR) << "Persistent fingerprint secret unavailable for " << path_
+               << ": " << fingerprint_initialization_error_;
+    return;
+  }
+  fingerprint_secret_ = result.secret;
+  OPENSSL_cleanse(result.secret.data(), result.secret.size());
+  fingerprint_ready_ = true;
+  UpdateFingerprintToken();
+}
+
+void ElectronBrowserContext::UpdateFingerprintToken() {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  CHECK(fingerprint_ready_);
+  std::string message(kFingerprintTokenContext);
+  message.push_back('\0');
+  if (fingerprint_.empty()) {
+    message.append("default", 7);
+    message.push_back('\0');
+    message.append(in_memory_ ? "memory" : "persist");
+    message.push_back('\0');
+    message.append(partition_.empty() ? "default" : partition_);
+  } else {
+    message.append("explicit", 8);
+    message.push_back('\0');
+    message.append(fingerprint_);
+  }
+
+  crypto::HMAC hmac(crypto::HMAC::SHA256);
+  CHECK(hmac.Init(fingerprint_secret_.data(), fingerprint_secret_.size()));
+  std::array<uint8_t, FingerprintProfile::kTokenDigestSize> digest{};
+  CHECK(hmac.Sign(message, digest.data(), digest.size()));
+  fingerprint_token_ = FingerprintProfile::EncodeToken(digest);
+  CHECK_EQ(fingerprint_token_.size(), FingerprintProfile::kEncodedTokenSize);
+
+  auto profile = FingerprintProfile::FromToken(fingerprint_token_,
+                                               GetFingerprintIgnoredDomains());
+  CHECK(profile);
+  if (profile->IsIgnored(FingerprintProfile::Domain::kNavigator)) {
+    device_memory_client_hint_profile_.reset();
+  } else {
+    device_memory_client_hint_profile_ =
+        profile->GetNavigatorSystemProfileIndex();
+  }
 }
 
 bool ElectronBrowserContext::CanUseHttpCache() const {
@@ -389,6 +519,18 @@ ElectronBrowserContext::GetBrowsingDataRemoverDelegate() {
 content::ClientHintsControllerDelegate*
 ElectronBrowserContext::GetClientHintsControllerDelegate() {
   return nullptr;
+}
+
+absl::optional<uint32_t>
+ElectronBrowserContext::GetDeviceMemoryClientHintProfile() {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  CHECK(fingerprint_ready_)
+      << "Refusing to expose client hints without a durable fingerprint "
+         "secret: "
+      << fingerprint_initialization_error_;
+  if (device_memory_client_hint_profile_)
+    fingerprint_locked_ = true;
+  return device_memory_client_hint_profile_;
 }
 
 content::StorageNotificationService*

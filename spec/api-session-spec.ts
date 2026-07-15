@@ -1276,6 +1276,122 @@ describe('session module', () => {
     });
   });
 
+  describe('ses.setFingerprint()', () => {
+    afterEach(closeAllWindows);
+
+    const getRendererFingerprintCommandLine = async (ses: Session) => {
+      const w = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          nodeIntegration: true,
+          contextIsolation: false,
+          session: ses
+        }
+      });
+      await w.loadURL('about:blank');
+      return await w.webContents.executeJavaScript(`(() => {
+        const commandLine = process._linkedBinding('electron_common_command_line');
+        return {
+          token: commandLine.getSwitchValue('fingerprint-token'),
+          tokenRequired: commandLine.hasSwitch('fingerprint-token-required'),
+          rawSeedSwitch: commandLine.getSwitchValue('fingerprint-partition'),
+          broadPartitionSwitch: commandLine.getSwitchValue('partition'),
+          rawIgnoreSwitch: commandLine.getSwitchValue('fingerprint-ignores'),
+          broadIgnoreSwitch: commandLine.getSwitchValue('ignores'),
+          argv: process.argv
+        };
+      })()`);
+    };
+
+    it('keeps the existing public session fallback without exposing a secret', () => {
+      const partitionA = 'fingerprint-a-' + Math.random();
+      const partitionB = 'fingerprint-b-' + Math.random();
+      const sesA = session.fromPartition(partitionA);
+      const sesAAgain = session.fromPartition(partitionA);
+      const sesB = session.fromPartition(partitionB);
+      const persistentSesA = session.fromPartition(`persist:${partitionA}`);
+
+      expect(sesA.getFingerprint()).to.equal(sesAAgain.getFingerprint());
+      expect(sesA.getFingerprint()).to.not.equal(sesB.getFingerprint());
+      expect(sesA.getFingerprint()).to.not.equal(persistentSesA.getFingerprint());
+    });
+
+    it('can be retrieved with getFingerprint()', () => {
+      const ses = session.fromPartition('' + Math.random());
+      expect(ses.getFingerprint()).to.match(/^memory:/);
+      ses.setFingerprint('manual-fingerprint');
+      expect(ses.getFingerprint()).to.equal('manual-fingerprint');
+      ses.setFingerprint('');
+      expect(ses.getFingerprint()).to.match(/^memory:/);
+    });
+
+    it('accepts Unicode and enforces the limit in UTF-8 bytes', () => {
+      const ses = session.fromPartition('fingerprint-unicode-' + Math.random());
+      const exactly1024Bytes = '😀'.repeat(256);
+      ses.setFingerprint(exactly1024Bytes);
+      expect(ses.getFingerprint()).to.equal(exactly1024Bytes);
+
+      expect(() => ses.setFingerprint('😀'.repeat(257)))
+        .to.throw(/must not exceed 1024 UTF-8 bytes/);
+      expect(ses.getFingerprint()).to.equal(exactly1024Bytes);
+    });
+
+    it('becomes immutable when the first renderer starts', async () => {
+      const ses = session.fromPartition('fingerprint-lock-' + Math.random());
+      ses.setFingerprint('before-renderer');
+      await getRendererFingerprintCommandLine(ses);
+
+      expect(() => ses.setFingerprint('after-renderer'))
+        .to.throw(/immutable after a renderer has started/);
+      expect(() => ses.setFingerprint('before-renderer'))
+        .to.throw(/immutable after a renderer has started/);
+      expect(ses.getFingerprint()).to.equal('before-renderer');
+    });
+
+    it('passes only a fixed token and keys equal seeds per persistent profile secret', async () => {
+      const rawSeed = `指纹-${Math.random()}-must-not-leak`;
+      const first = session.fromPartition('persist:fingerprint-token-a-' + Math.random());
+      const second = session.fromPartition('persist:fingerprint-token-b-' + Math.random());
+      first.setFingerprint(rawSeed);
+      second.setFingerprint(rawSeed);
+
+      const firstCommandLine = await getRendererFingerprintCommandLine(first);
+      const secondCommandLine = await getRendererFingerprintCommandLine(second);
+      expect(firstCommandLine.token).to.match(/^v1\.[A-Za-z0-9_-]{43}$/);
+      expect(secondCommandLine.token).to.match(/^v1\.[A-Za-z0-9_-]{43}$/);
+      expect(firstCommandLine.tokenRequired).to.be.true();
+      expect(secondCommandLine.tokenRequired).to.be.true();
+      expect(firstCommandLine.token).to.not.equal(secondCommandLine.token);
+      expect(firstCommandLine.token).to.not.contain(rawSeed);
+      expect(firstCommandLine.rawSeedSwitch).to.equal('');
+      expect(firstCommandLine.broadPartitionSwitch).to.equal('');
+      expect(firstCommandLine.rawIgnoreSwitch).to.equal('');
+      expect(firstCommandLine.broadIgnoreSwitch).to.equal('');
+      expect(firstCommandLine.argv.join('\0')).to.not.contain(rawSeed);
+    });
+
+    it('uses context-local random material for in-memory sessions', async () => {
+      const first = session.fromPartition('fingerprint-memory-a-' + Math.random());
+      const second = session.fromPartition('fingerprint-memory-b-' + Math.random());
+      first.setFingerprint('same-seed');
+      second.setFingerprint('same-seed');
+
+      const firstCommandLine = await getRendererFingerprintCommandLine(first);
+      const secondCommandLine = await getRendererFingerprintCommandLine(second);
+      expect(firstCommandLine.token).to.not.equal(secondCommandLine.token);
+      expect(first.storagePath).to.be.null();
+      expect(second.storagePath).to.be.null();
+    });
+
+    it('keeps a stable token for renderers in the same browser context', async () => {
+      const ses = session.fromPartition(`persist:fingerprint-stable-${Math.random()}`);
+      ses.setFingerprint('stable-explicit-seed');
+      const first = await getRendererFingerprintCommandLine(ses);
+      const second = await getRendererFingerprintCommandLine(ses);
+      expect(first.token).to.equal(second.token);
+    });
+  });
+
   describe('session-created event', () => {
     it('is emitted when a session is created', async () => {
       const sessionCreated = emittedOnce(app, 'session-created');
