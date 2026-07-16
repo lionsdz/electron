@@ -4,6 +4,48 @@ import("//printing/buildflags/buildflags.gni")
 import("//tools/grit/repack.gni")
 import("//ui/base/ui_features.gni")
 
+declare_args() {
+  # Empty means Chromium's full desktop locale set for the current platform.
+  # Set to a subset such as [ "en-US", "zh-CN" ] for smaller Electron bundles.
+  electron_packaged_locales = []
+
+  # Package chrome://media-internals, chrome://tracing, and
+  # chrome://webrtc-internals resources. These are useful diagnostics pages but
+  # are not required for normal Electron app runtime.
+  enable_electron_diagnostic_webui_resources = true
+}
+
+foreach(locale, electron_packaged_locales) {
+  _electron_locale_is_supported = false
+  foreach(platform_locale, platform_pak_locales) {
+    if (locale == platform_locale) {
+      _electron_locale_is_supported = true
+    }
+  }
+  assert(_electron_locale_is_supported,
+         "electron_packaged_locales contains unsupported locale: $locale")
+}
+
+electron_pak_locales = []
+if (electron_packaged_locales != []) {
+  electron_pak_locales += electron_packaged_locales
+} else {
+  electron_pak_locales += platform_pak_locales
+}
+
+if (is_mac) {
+  electron_pak_output_locales = []
+  foreach(locale, electron_pak_locales) {
+    if (locale == "en-US") {
+      electron_pak_output_locales += [ "en" ]
+    } else {
+      electron_pak_output_locales += [ string_replace(locale, "-", "_") ]
+    }
+  }
+} else {
+  electron_pak_output_locales = electron_pak_locales
+}
+
 # See: //chrome/chrome_paks.gni
 template("electron_repack_percent") {
   percent = invoker.percent
@@ -56,9 +98,6 @@ template("electron_extra_paks") {
       "$root_gen_dir/chrome/common_resources.pak",
       "$root_gen_dir/chrome/dev_ui_browser_resources.pak",
       "$root_gen_dir/components/components_resources.pak",
-      "$root_gen_dir/content/browser/resources/media/media_internals_resources.pak",
-      "$root_gen_dir/content/browser/tracing/tracing_resources.pak",
-      "$root_gen_dir/content/browser/webrtc/resources/webrtc_internals_resources.pak",
       "$root_gen_dir/content/content_resources.pak",
       "$root_gen_dir/content/dev_ui_content_resources.pak",
       "$root_gen_dir/mojo/public/js/mojo_bindings_resources.pak",
@@ -74,9 +113,6 @@ template("electron_extra_paks") {
       "//components/resources",
       "//content:content_resources",
       "//content:dev_ui_content_resources",
-      "//content/browser/resources/media:resources",
-      "//content/browser/tracing:resources",
-      "//content/browser/webrtc/resources",
       "//electron:resources",
       "//mojo/public/js:resources",
       "//net:net_resources",
@@ -84,6 +120,22 @@ template("electron_extra_paks") {
       "//third_party/blink/public:resources",
       "//ui/resources",
     ]
+    if (enable_electron_slim_chrome_resources) {
+      sources -= [ "$root_gen_dir/chrome/common_resources.pak" ]
+      deps -= [ "//chrome/common:resources" ]
+    }
+    if (enable_electron_diagnostic_webui_resources) {
+      sources += [
+        "$root_gen_dir/content/browser/resources/media/media_internals_resources.pak",
+        "$root_gen_dir/content/browser/tracing/tracing_resources.pak",
+        "$root_gen_dir/content/browser/webrtc/resources/webrtc_internals_resources.pak",
+      ]
+      deps += [
+        "//content/browser/resources/media:resources",
+        "//content/browser/tracing:resources",
+        "//content/browser/webrtc/resources",
+      ]
+    }
     if (defined(invoker.deps)) {
       deps += invoker.deps
     }
@@ -204,14 +256,9 @@ template("electron_paks") {
       "//ui/strings:ui_strings",
     ]
 
-    input_locales = platform_pak_locales
+    input_locales = electron_pak_locales
     output_dir = "${invoker.output_dir}/locales"
-
-    if (is_mac) {
-      output_locales = locales_as_apple_outputs
-    } else {
-      output_locales = platform_pak_locales
-    }
+    output_locales = electron_pak_output_locales
   }
 
   group(target_name) {

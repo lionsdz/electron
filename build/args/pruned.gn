@@ -1,0 +1,78 @@
+import("release.gn")
+
+# Size-focused Electron profile for embedders that control the app feature set.
+# This is intentionally opt-in: each disabled feature below removes public
+# Electron or Chromium web-platform behavior that some apps may rely on.
+
+# Package only required locales. Add app-supported locales here, for example
+# [ "en-US", "zh-CN" ].
+electron_packaged_locales = [ "en-US" ]
+
+# Do not package Chromium diagnostic WebUI pages such as chrome://tracing,
+# chrome://media-internals, and chrome://webrtc-internals.
+enable_electron_diagnostic_webui_resources = false
+
+# Remove optional Electron APIs and associated Chromium sources.
+enable_desktop_capturer = false
+enable_run_as_node = false
+enable_osr = false
+enable_pdf_viewer = false
+enable_electron_extensions = false
+enable_builtin_spellchecker = false
+enable_tts = false
+enable_picture_in_picture = false
+
+# Remove Chrome PDF/plugin/printing stacks. Leave these true if the app uses
+# webContents.print(), webContents.printToPDF(), <embed>/<object>, or PDF files.
+enable_basic_printing = false
+enable_print_preview = false
+enable_oop_printing = false
+enable_tagged_pdf = false
+enable_pdf = false
+enable_plugins = false
+enable_ppapi = false
+enable_extensions = false
+
+# Remove codecs/features that are useful for a browser but optional for many
+# controlled Electron apps.
+proprietary_codecs = false
+ffmpeg_branding = "Chromium"
+rtc_use_h264 = false
+media_use_openh264 = false
+
+# Trim media formats that are only useful if the app needs broad browser-like
+# playback support. Keep these enabled for arbitrary web content, WebRTC-heavy
+# apps, VP8/VP9/AV1 playback, AVIF, or JPEG XL image support.
+media_use_libvpx = false
+enable_dav1d_decoder = false
+enable_libgav1_decoder = false
+use_libgav1_parser = false
+enable_libaom = false
+enable_av1_decoder = false
+enable_jxl_decoder = false
+
+# Remove browser services Electron apps rarely need. Keep safe_browsing_mode
+# enabled if your app downloads untrusted files and depends on Chromium's Safe
+# Browsing checks.
+safe_browsing_mode = 0
+enable_reporting = false
+use_kerberos = false
+enable_captive_portal_detection = false
+enable_media_remoting = false
+enable_media_remoting_rpc = false
+enable_screen_ai_service = false
+enable_feed_v2 = false
+
+# Remove fallback/experimental GPU stacks. Keep these enabled if the app needs
+# SwiftShader fallback, Vulkan, or WebGPU.
+enable_swiftshader = false
+enable_swiftshader_vulkan = false
+angle_enable_swiftshader = false
+angle_enable_vulkan = false
+dawn_use_swiftshader = false
+dawn_enable_vulkan = false
+enable_vulkan = false
+use_dawn = false
+
+# Do not emit 200% resource pak files. Keep true for best high-DPI icon quality.
+enable_hidpi = false

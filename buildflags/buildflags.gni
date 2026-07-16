@@ -32,6 +32,15 @@ declare_args() {
   # Enable Spellchecker support
   enable_builtin_spellchecker = true
 
+  # Link only the Chrome common sources used by Electron. This stays disabled
+  # by default so upstream Electron build profiles keep their existing graph.
+  enable_electron_slim_chrome_common = false
+
+  # Package only the Chrome resources that Electron's WebUI and extension
+  # integration consume. Keep this opt-in so default Electron builds retain
+  # Chromium's complete resource set.
+  enable_electron_slim_chrome_resources = false
+
   # Build EASR v2 archives and install their key provider in every Electron
   # process. This is deliberately opt-in: false keeps ordinary ASAR packaging
   # and ordinary-ASAR runtime behavior fully compatible.
@@ -65,6 +74,12 @@ declare_args() {
   easar_v2_compression_level = 9
   easar_v2_enable_compression = true
 }
+
+assert(!enable_electron_slim_chrome_resources ||
+           enable_electron_slim_chrome_common,
+       "Slim Chrome resources require enable_electron_slim_chrome_common")
+assert(!enable_electron_slim_chrome_resources || !enable_pdf_viewer,
+       "Slim Chrome resources do not include PDF viewer resources")
 
 assert(!easar_v2_require_encrypted || enable_easar_v2,
        "easar_v2_require_encrypted requires enable_easar_v2")

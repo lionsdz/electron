@@ -97,8 +97,10 @@ class BrowserProcessImpl : public BrowserProcess {
   HidPolicyAllowedDevices* hid_policy_allowed_devices() override;
   void CreateDevToolsProtocolHandler() override {}
   void CreateDevToolsAutoOpener() override {}
+#if BUILDFLAG(ENABLE_BACKGROUND_MODE)
   void set_background_mode_manager_for_test(
       std::unique_ptr<BackgroundModeManager> manager) override {}
+#endif
 #if (BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX))
   void StartAutoupdateTimer() override {}
 #endif

@@ -1,0 +1,106 @@
+import("release.gn")
+
+# Pruning profile for:
+# - D:\code\js\pdd_auto_electron_egg
+# - D:\code\js\kefu_mofo_client
+#
+# The two apps use BrowserWindow, session partitions, webRequest/proxy,
+# notifications, tray/menu/globalShortcut, the DevTools Protocol for PDD login,
+# and <webview> in kefu_mofo_client. Keep the extension/GuestView stack and
+# H.264/MP4 playback; prune only features not found in those projects.
+
+# Both apps force zh-CN and their packaging hooks already delete other locale
+# pak files. Build only the locale that survives packaging.
+electron_packaged_locales = [ "zh-CN" ]
+mini_installer_archive_locale = "zh-CN"
+ignore_appcontainer_acl_errors = true
+
+# Do not package Chromium diagnostic WebUI pages such as chrome://tracing,
+# chrome://media-internals, and chrome://webrtc-internals.
+enable_electron_diagnostic_webui_resources = false
+
+# Electron APIs not used by these apps.
+enable_desktop_capturer = false
+enable_run_as_node = false
+enable_osr = false
+enable_builtin_spellchecker = false
+enable_tts = false
+enable_picture_in_picture = false
+
+# kefu_mofo_client uses <webview>, so the extension/GuestView stack must stay.
+enable_electron_extensions = true
+enable_extensions = true
+
+# Replace Chrome's broad common aggregation target with the subset consumed by
+# Electron while retaining generated extension API types and Win delay-load.
+enable_electron_slim_chrome_common = true
+enable_electron_slim_chrome_resources = true
+
+# No webContents.print(), printToPDF(), or built-in PDF preview path was found
+# in the application sources. PDF URLs may download/open externally instead of
+# rendering in Chromium when these are disabled.
+enable_basic_printing = false
+enable_print_preview = false
+enable_oop_printing = false
+enable_tagged_pdf = false
+enable_pdf_viewer = false
+enable_pdf = false
+enable_plugins = false
+enable_ppapi = false
+
+# Keep MP4/H.264 playback for PDD pages and video download/preview flows.
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+
+# No WebRTC capture/calling usage was found. This keeps normal MP4 playback but
+# removes H.264 WebRTC/OpenH264 encode/decode paths.
+rtc_use_h264 = false
+media_use_openh264 = false
+
+# Trim optional media/image formats not required by the inspected flows.
+media_use_libvpx = false
+enable_dav1d_decoder = false
+enable_libgav1_decoder = false
+use_libgav1_parser = false
+enable_libaom = false
+enable_av1_decoder = false
+enable_jxl_decoder = false
+
+# Browser/Chrome services not used by the two controlled apps.
+safe_browsing_mode = 0
+enable_reporting = false
+use_kerberos = false
+enable_captive_portal_detection = false
+enable_media_remoting = false
+enable_media_remoting_rpc = false
+enable_remoting = false
+enable_screen_ai_service = false
+enable_feed_v2 = false
+enable_reading_list = false
+enable_background_mode = false
+enable_maldoca = false
+enable_speech_service = false
+enable_browser_speech_service = false
+enable_vr = false
+enable_openxr = false
+enable_shape_detection = false
+
+# Electron does not consume Chromium's on-device permission-prompt prediction
+# model. This profile already disables Safe Browsing, so neither on-device nor
+# server-side prediction is selected; the normal permission UI remains. Drop
+# TFLite, XNNPACK, and content/app's standalone CPUInfo edge.
+build_with_tflite_lib = false
+build_tflite_with_xnnpack = false
+
+# Keep the normal Windows GPU/ANGLE path and SwiftShader fallback for PDD login
+# fingerprint stability, but remove Vulkan/WebGPU paths.
+enable_vulkan = false
+angle_enable_vulkan = false
+dawn_use_swiftshader = false
+dawn_enable_vulkan = false
+use_dawn = false
+enable_swiftshader_vulkan = false
+
+# Do not emit 200% resource pak files. Keep true if native Electron icons need
+# best high-DPI quality.
+enable_hidpi = false
