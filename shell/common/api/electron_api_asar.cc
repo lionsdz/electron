@@ -91,18 +91,17 @@ ReadFileResult OpenAndReadPath(const base::FilePath& full_path) {
   return ReadArchiveFile(std::move(archive), path);
 }
 
-void FreeReadFileBuffer(char*, void* hint) {
-  delete static_cast<ReadFileStorage*>(hint);
-}
-
 v8::Local<v8::Object> MakeReadFileBuffer(v8::Isolate* isolate,
                                          OwnedReadFileStorage storage) {
   if (!storage || storage->contents.empty())
     return node::Buffer::New(isolate, 0).ToLocalChecked();
-  char* data = storage->contents.data();
-  const size_t size = storage->contents.size();
-  ReadFileStorage* hint = storage.release();
-  return node::Buffer::New(isolate, data, size, &FreeReadFileBuffer, hint)
+
+  // EASR decrypts and decompresses into embedder-owned memory. V8's memory
+  // sandbox cannot expose that allocation as an ArrayBuffer backing store, so
+  // copy the verified bytes into V8-owned memory. Destroying |storage| here
+  // also promptly cleanses plaintext produced by encrypted archives.
+  return node::Buffer::Copy(isolate, storage->contents.data(),
+                            storage->contents.size())
       .ToLocalChecked();
 }
 
