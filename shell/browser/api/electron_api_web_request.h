@@ -5,10 +5,15 @@
 #ifndef ELECTRON_SHELL_BROWSER_API_ELECTRON_API_WEB_REQUEST_H_
 #define ELECTRON_SHELL_BROWSER_API_ELECTRON_API_WEB_REQUEST_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <map>
+#include <memory>
 #include <set>
+#include <vector>
 
 #include "base/values.h"
+#include "extensions/browser/api/web_request/web_request_resource_type.h"
 #include "extensions/common/url_pattern.h"
 #include "gin/arguments.h"
 #include "gin/handle.h"
@@ -72,6 +77,16 @@ class WebRequest : public gin::Wrappable<WebRequest>, public WebRequestAPI {
                         const GURL& new_location) override;
   void OnResponseStarted(extensions::WebRequestInfo* info,
                          const network::ResourceRequest& request) override;
+  bool ShouldCaptureResponseBody(
+      extensions::WebRequestInfo* info,
+      const network::ResourceRequest& request,
+      const network::mojom::URLResponseHead& response,
+      size_t* max_bytes) override;
+  void OnResponseBody(extensions::WebRequestInfo* info,
+                      const network::ResourceRequest& request,
+                      const network::mojom::URLResponseHead& response,
+                      std::vector<uint8_t> body,
+                      bool truncated) override;
   void OnErrorOccurred(extensions::WebRequestInfo* info,
                        const network::ResourceRequest& request,
                        int net_error) override;
@@ -101,11 +116,14 @@ class WebRequest : public gin::Wrappable<WebRequest>, public WebRequestAPI {
   using ResponseCallback = base::OnceCallback<void(v8::Local<v8::Value>)>;
   using ResponseListener =
       base::RepeatingCallback<void(v8::Local<v8::Value>, ResponseCallback)>;
+  using ResponseBodyListener =
+      base::RepeatingCallback<void(v8::Local<v8::Value>)>;
 
   template <SimpleEvent event>
   void SetSimpleListener(gin::Arguments* args);
   template <ResponseEvent event>
   void SetResponseListener(gin::Arguments* args);
+  void SetResponseBodyListener(gin::Arguments* args);
   template <typename Listener, typename Listeners, typename Event>
   void SetListener(Event event, Listeners* listeners, gin::Arguments* args);
 
@@ -141,8 +159,29 @@ class WebRequest : public gin::Wrappable<WebRequest>, public WebRequestAPI {
     ~ResponseListenerInfo();
   };
 
+  struct ResponseBodyListenerInfo {
+    std::set<URLPattern> url_patterns;
+    std::set<extensions::WebRequestResourceType> resource_types;
+    std::set<std::string> content_types;
+    size_t max_bytes = 0;
+    uint64_t generation = 0;
+    ResponseBodyListener listener;
+
+    ResponseBodyListenerInfo(std::set<URLPattern>,
+                             std::set<extensions::WebRequestResourceType>,
+                             std::set<std::string>,
+                             size_t,
+                             uint64_t,
+                             ResponseBodyListener);
+    ResponseBodyListenerInfo();
+    ~ResponseBodyListenerInfo();
+  };
+
   std::map<SimpleEvent, SimpleListenerInfo> simple_listeners_;
   std::map<ResponseEvent, ResponseListenerInfo> response_listeners_;
+  std::unique_ptr<ResponseBodyListenerInfo> response_body_listener_;
+  uint64_t response_body_listener_generation_ = 0;
+  std::map<uint64_t, uint64_t> response_body_capture_generations_;
   std::map<uint64_t, net::CompletionOnceCallback> callbacks_;
 
   // Weak-ref, it manages us.

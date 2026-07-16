@@ -547,9 +547,18 @@ describe('protocol module', () => {
       expect(r.data).to.be.equal(text);
     });
 
-    it('sends error when callback is called with nothing', async () => {
-      interceptStringProtocol('http', (request, callback: any) => callback());
-      await expect(ajax('http://fake-host')).to.be.eventually.rejected();
+    it('passes through when callback is called with nothing', async () => {
+      const server = http.createServer((req, res) => res.end(text));
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+      try {
+        const port = (server.address() as AddressInfo).port;
+        interceptStringProtocol('http', (request, callback: any) => callback());
+        const r = await ajax(`http://127.0.0.1:${port}`);
+        expect(r.data).to.equal(text);
+      } finally {
+        server.close();
+      }
     });
   });
 
@@ -606,6 +615,20 @@ describe('protocol module', () => {
       });
       const r = await ajax('http://fake-host', { method: 'POST', body: qs.stringify(postData) });
       expect(qs.parse(r.data)).to.deep.equal({ name: 'post test', type: 'string' });
+    });
+
+    it('passes through when callback is called with nothing', async () => {
+      const server = http.createServer((req, res) => res.end(text));
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+      try {
+        const port = (server.address() as AddressInfo).port;
+        interceptBufferProtocol('http', (request, callback: any) => callback());
+        const r = await ajax(`http://127.0.0.1:${port}`);
+        expect(r.data).to.equal(text);
+      } finally {
+        server.close();
+      }
     });
   });
 

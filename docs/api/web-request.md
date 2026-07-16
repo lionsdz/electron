@@ -52,7 +52,7 @@ The following methods are available on instances of `WebRequest`:
     * `webContentsId` Integer (optional)
     * `webContents` WebContents (optional)
     * `frame` WebFrameMain (optional)
-    * `resourceType` string - Can be `mainFrame`, `subFrame`, `stylesheet`, `script`, `image`, `font`, `object`, `xhr`, `ping`, `cspReport`, `media`, `webSocket` or `other`.
+    * `resourceType` string - Can be `mainFrame`, `subFrame`, `stylesheet`, `script`, `image`, `font`, `object`, `xhr`, `ping`, `cspReport`, `media`, `webSocket`, `webTransport`, `webBundle` or `other`.
     * `referrer` string
     * `timestamp` Double
     * `uploadData` [UploadData[]](structures/upload-data.md)
@@ -186,6 +186,42 @@ The `callback` has to be called with a `response` object.
 The `listener` will be called with `listener(details)` when first byte of the
 response body is received. For HTTP requests, this means that the status line
 and response headers are available.
+
+#### `webRequest.onResponseBody(filter, listener)`
+
+* `filter` [WebRequestBodyFilter](structures/web-request-body-filter.md)
+* `listener` Function | null
+  * `details` Object
+    * `id` Integer
+    * `url` string
+    * `method` string
+    * `webContentsId` Integer (optional)
+    * `webContents` WebContents (optional)
+    * `frame` WebFrameMain (optional)
+    * `resourceType` string - Can be `mainFrame`, `subFrame`, `stylesheet`, `script`, `image`, `font`, `object`, `xhr`, `ping`, `cspReport`, `media`, `webSocket` or `other`.
+    * `referrer` string
+    * `timestamp` Double
+    * `responseHeaders` Record<string, string[]> (optional)
+    * `fromCache` boolean
+    * `statusCode` Integer
+    * `statusLine` string
+    * `mimeType` string - The normalized response MIME type used by the
+      `contentTypes` filter.
+    * `body` Buffer - The captured response body bytes, limited by `maxBytes`.
+    * `bodySize` Double - The number of bytes in `body`.
+    * `bodyTruncated` boolean - Whether the response body exceeded `maxBytes`.
+    * `maxBytes` Double - The capture limit that was applied.
+
+The `listener` will be called with `listener(details)` after a matching response
+body has been copied. The original response body is forwarded unchanged to the
+page; `maxBytes` only limits the copy delivered to the listener and is capped at
+16 MiB.
+
+This API is disabled by default and requires a `filter` with explicit `urls` and
+`contentTypes` whitelists. If `resourceTypes` is omitted, only `xhr` responses
+are captured. The `contentTypes` entries match normalized MIME types such as
+`application/json` and support `type/*` wildcards. Use an all-types wildcard to
+capture any MIME type. Pass `null` as the only argument to unsubscribe.
 
 #### `webRequest.onBeforeRedirect([filter, ]listener)`
 

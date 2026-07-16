@@ -4,17 +4,24 @@
 
 #include "shell/browser/net/proxying_url_loader_factory.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "base/bind.h"
 #include "base/callback_helpers.h"
 #include "base/command_line.h"
+#include "base/containers/span.h"
 #include "base/strings/string_split.h"
 #include "base/strings/string_util.h"
 #include "base/strings/stringprintf.h"
+#include "base/threading/sequenced_task_runner_handle.h"
 #include "content/public/browser/browser_context.h"
 #include "extensions/browser/extension_navigation_ui_data.h"
+#include "mojo/public/cpp/system/data_pipe.h"
+#include "mojo/public/cpp/system/simple_watcher.h"
 #include "net/base/completion_repeating_callback.h"
 #include "net/base/load_flags.h"
 #include "net/http/http_response_headers.h"
@@ -34,6 +41,171 @@ ProxyingURLLoaderFactory::InProgressRequest::FollowRedirectParams::
     FollowRedirectParams() = default;
 ProxyingURLLoaderFactory::InProgressRequest::FollowRedirectParams::
     ~FollowRedirectParams() = default;
+
+class ProxyingURLLoaderFactory::InProgressRequest::ResponseBodyCapture {
+ public:
+  using DoneCallback = base::OnceCallback<void(std::vector<uint8_t>, bool)>;
+
+  ResponseBodyCapture(mojo::ScopedDataPipeConsumerHandle source,
+                      mojo::ScopedDataPipeProducerHandle client_producer,
+                      size_t max_bytes,
+                      DoneCallback done_callback)
+      : source_(std::move(source)),
+        client_producer_(std::move(client_producer)),
+        max_bytes_(max_bytes),
+        done_callback_(std::move(done_callback)),
+        source_watcher_(FROM_HERE,
+                        mojo::SimpleWatcher::ArmingPolicy::MANUAL,
+                        base::SequencedTaskRunnerHandle::Get()),
+        client_producer_watcher_(FROM_HERE,
+                                 mojo::SimpleWatcher::ArmingPolicy::MANUAL,
+                                 base::SequencedTaskRunnerHandle::Get()) {}
+
+  ResponseBodyCapture(const ResponseBodyCapture&) = delete;
+  ResponseBodyCapture& operator=(const ResponseBodyCapture&) = delete;
+
+  ~ResponseBodyCapture() {
+    source_watcher_.Cancel();
+    client_producer_watcher_.Cancel();
+  }
+
+  bool Start() {
+    if (!source_.is_valid() || !client_producer_.is_valid())
+      return false;
+
+    MojoResult result = source_watcher_.Watch(
+        source_.get(),
+        MOJO_HANDLE_SIGNAL_READABLE | MOJO_HANDLE_SIGNAL_PEER_CLOSED,
+        base::BindRepeating(&ResponseBodyCapture::OnBodyReadable,
+                            base::Unretained(this)));
+    if (result != MOJO_RESULT_OK)
+      return false;
+
+    result = client_producer_watcher_.Watch(
+        client_producer_.get(),
+        MOJO_HANDLE_SIGNAL_WRITABLE | MOJO_HANDLE_SIGNAL_PEER_CLOSED,
+        base::BindRepeating(&ResponseBodyCapture::OnBodyWritable,
+                            base::Unretained(this)));
+    if (result != MOJO_RESULT_OK)
+      return false;
+
+    source_watcher_.ArmOrNotify();
+    return true;
+  }
+
+  mojo::ScopedDataPipeConsumerHandle ReleaseSourceForFallback() {
+    source_watcher_.Cancel();
+    client_producer_watcher_.Cancel();
+    client_producer_.reset();
+    return std::move(source_);
+  }
+
+ private:
+  void OnBodyReadable(MojoResult result) {
+    if (finished_)
+      return;
+    if (result != MOJO_RESULT_OK && result != MOJO_RESULT_FAILED_PRECONDITION) {
+      Finish(/*truncated=*/true);
+      return;
+    }
+    ForwardBodyToClient();
+  }
+
+  void OnBodyWritable(MojoResult result) {
+    if (finished_)
+      return;
+    if (result != MOJO_RESULT_OK) {
+      Finish(/*truncated=*/true);
+      return;
+    }
+    ForwardBodyToClient();
+  }
+
+  void Capture(base::span<const uint8_t> bytes) {
+    if (bytes.empty())
+      return;
+
+    if (captured_body_.size() < max_bytes_) {
+      const size_t remaining = max_bytes_ - captured_body_.size();
+      const size_t bytes_to_capture = std::min(remaining, bytes.size());
+      captured_body_.insert(captured_body_.end(), bytes.begin(),
+                            bytes.begin() + bytes_to_capture);
+      if (bytes_to_capture < bytes.size())
+        truncated_ = true;
+    } else {
+      truncated_ = true;
+    }
+  }
+
+  void ForwardBodyToClient() {
+    const void* buffer = nullptr;
+    uint32_t buffer_size = 0;
+    MojoResult result = source_->BeginReadData(&buffer, &buffer_size,
+                                               MOJO_BEGIN_READ_DATA_FLAG_NONE);
+    switch (result) {
+      case MOJO_RESULT_OK:
+        break;
+      case MOJO_RESULT_SHOULD_WAIT:
+        source_watcher_.ArmOrNotify();
+        return;
+      case MOJO_RESULT_FAILED_PRECONDITION:
+        Finish(/*truncated=*/false);
+        return;
+      default:
+        Finish(/*truncated=*/true);
+        return;
+    }
+
+    result = client_producer_->WriteData(buffer, &buffer_size,
+                                         MOJO_WRITE_DATA_FLAG_NONE);
+    switch (result) {
+      case MOJO_RESULT_OK:
+        Capture(
+            base::make_span(static_cast<const uint8_t*>(buffer), buffer_size));
+        source_->EndReadData(buffer_size);
+        source_watcher_.ArmOrNotify();
+        return;
+      case MOJO_RESULT_SHOULD_WAIT:
+        source_->EndReadData(0);
+        client_producer_watcher_.ArmOrNotify();
+        return;
+      case MOJO_RESULT_FAILED_PRECONDITION:
+        source_->EndReadData(0);
+        Finish(/*truncated=*/true);
+        return;
+      default:
+        source_->EndReadData(0);
+        Finish(/*truncated=*/true);
+        return;
+    }
+  }
+
+  void Finish(bool truncated) {
+    if (finished_)
+      return;
+
+    finished_ = true;
+    truncated_ = truncated_ || truncated;
+    source_watcher_.Cancel();
+    client_producer_watcher_.Cancel();
+    source_.reset();
+    client_producer_.reset();
+
+    base::SequencedTaskRunnerHandle::Get()->PostTask(
+        FROM_HERE, base::BindOnce(std::move(done_callback_),
+                                  std::move(captured_body_), truncated_));
+  }
+
+  mojo::ScopedDataPipeConsumerHandle source_;
+  mojo::ScopedDataPipeProducerHandle client_producer_;
+  const size_t max_bytes_;
+  std::vector<uint8_t> captured_body_;
+  bool truncated_ = false;
+  bool finished_ = false;
+  DoneCallback done_callback_;
+  mojo::SimpleWatcher source_watcher_;
+  mojo::SimpleWatcher client_producer_watcher_;
+};
 
 ProxyingURLLoaderFactory::InProgressRequest::InProgressRequest(
     ProxyingURLLoaderFactory* factory,
@@ -304,12 +476,18 @@ void ProxyingURLLoaderFactory::InProgressRequest::OnComplete(
     return;
   }
 
-  target_client_->OnComplete(status);
-  factory_->web_request_api()->OnCompleted(&info_.value(), request_,
-                                           status.error_code);
+  if (response_body_capture_) {
+    // A captured response can remain backpressured until the renderer drains
+    // its body pipe. Preserve URLLoaderClient streaming semantics by reporting
+    // network completion immediately; retain this request only long enough to
+    // deliver the optional JavaScript body copy and webRequest completion.
+    target_client_->OnComplete(status);
+    target_completion_sent_ = true;
+    pending_complete_status_ = status;
+    return;
+  }
 
-  // Deletes |this|.
-  factory_->RemoveRequest(network_service_request_id_, request_id_);
+  CompleteRequest(status);
 }
 
 bool ProxyingURLLoaderFactory::IsForServiceWorkerScript() const {
@@ -621,6 +799,83 @@ void ProxyingURLLoaderFactory::InProgressRequest::
     proxied_client_receiver_.Resume();
 }
 
+mojo::ScopedDataPipeConsumerHandle
+ProxyingURLLoaderFactory::InProgressRequest::MaybeStartResponseBodyCapture(
+    mojo::ScopedDataPipeConsumerHandle body) {
+  DCHECK(info_.has_value());
+  DCHECK(current_response_);
+
+  size_t max_bytes = 0;
+  if (!factory_->web_request_api()->ShouldCaptureResponseBody(
+          &info_.value(), request_, *current_response_, &max_bytes)) {
+    return body;
+  }
+
+  if (!body.is_valid()) {
+    captured_response_body_ = std::vector<uint8_t>();
+    captured_response_body_truncated_ = false;
+    return body;
+  }
+
+  mojo::ScopedDataPipeProducerHandle client_producer;
+  mojo::ScopedDataPipeConsumerHandle client_body;
+  if (mojo::CreateDataPipe(nullptr, client_producer, client_body) !=
+      MOJO_RESULT_OK) {
+    return body;
+  }
+
+  auto capture = std::make_unique<ResponseBodyCapture>(
+      std::move(body), std::move(client_producer), max_bytes,
+      base::BindOnce(&InProgressRequest::OnResponseBodyCaptureComplete,
+                     weak_factory_.GetWeakPtr()));
+  if (!capture->Start())
+    return capture->ReleaseSourceForFallback();
+
+  response_body_capture_ = std::move(capture);
+  return client_body;
+}
+
+void ProxyingURLLoaderFactory::InProgressRequest::OnResponseBodyCaptureComplete(
+    std::vector<uint8_t> body,
+    bool truncated) {
+  captured_response_body_ = std::move(body);
+  captured_response_body_truncated_ = truncated;
+  response_body_capture_.reset();
+
+  absl::optional<network::URLLoaderCompletionStatus> pending_status =
+      std::move(pending_complete_status_);
+  pending_complete_status_.reset();
+  if (pending_status) {
+    CompleteRequest(pending_status.value());
+  }
+}
+
+void ProxyingURLLoaderFactory::InProgressRequest::CompleteRequest(
+    const network::URLLoaderCompletionStatus& status) {
+  if (!target_completion_sent_)
+    target_client_->OnComplete(status);
+  target_completion_sent_ = false;
+  DispatchCapturedResponseBody();
+  factory_->web_request_api()->OnCompleted(&info_.value(), request_,
+                                           status.error_code);
+
+  // Deletes |this|.
+  factory_->RemoveRequest(network_service_request_id_, request_id_);
+}
+
+void ProxyingURLLoaderFactory::InProgressRequest::
+    DispatchCapturedResponseBody() {
+  if (!captured_response_body_)
+    return;
+
+  std::vector<uint8_t> body = std::move(captured_response_body_.value());
+  captured_response_body_.reset();
+  factory_->web_request_api()->OnResponseBody(
+      &info_.value(), request_, *current_response_, std::move(body),
+      captured_response_body_truncated_);
+  captured_response_body_truncated_ = false;
+}
+
 void ProxyingURLLoaderFactory::InProgressRequest::ContinueToResponseStarted(
     int error_code) {
   DCHECK(!for_cors_preflight_);
@@ -666,6 +921,7 @@ void ProxyingURLLoaderFactory::InProgressRequest::ContinueToResponseStarted(
   proxied_client_receiver_.Resume();
 
   factory_->web_request_api()->OnResponseStarted(&info_.value(), request_);
+  current_body_ = MaybeStartResponseBodyCapture(std::move(current_body_));
   target_client_->OnReceiveResponse(current_response_.Clone(),
                                     std::move(current_body_),
                                     std::move(current_cached_metadata_));
@@ -790,38 +1046,59 @@ bool ProxyingURLLoaderFactory::ShouldIgnoreConnectionsLimit(
   return false;
 }
 
-  // static
-  void ProxyingURLLoaderFactory::StartLoading(
-      mojo::PendingReceiver<network::mojom::URLLoader> loader,
-      int32_t request_id,
-      uint32_t options,
-      const network::ResourceRequest& request,
-      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
-      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation,
-      mojo::PendingRemote<network::mojom::URLLoaderFactory> target_factory,
-      ProtocolType type,
-      gin::Arguments* args) {
+namespace {
+
+bool IsNullUndefinedOrEmptyObject(v8::Isolate* isolate,
+                                  v8::Local<v8::Value> response) {
+  if (response->IsNullOrUndefined())
+    return true;
+
+  if (!response->IsObject())
+    return false;
+
+  v8::TryCatch try_catch(isolate);
+  v8::Local<v8::Array> property_names;
+  if (!response.As<v8::Object>()
+           ->GetOwnPropertyNames(isolate->GetCurrentContext())
+           .ToLocal(&property_names)) {
+    return false;
+  }
+
+  return property_names->Length() == 0;
+}
+
+}  // namespace
+
+// static
+void ProxyingURLLoaderFactory::StartLoading(
+    mojo::PendingReceiver<network::mojom::URLLoader> loader,
+    int32_t request_id,
+    uint32_t options,
+    const network::ResourceRequest& request,
+    mojo::PendingRemote<network::mojom::URLLoaderClient> client,
+    const net::MutableNetworkTrafficAnnotationTag& traffic_annotation,
+    mojo::PendingRemote<network::mojom::URLLoaderFactory> target_factory,
+    ProtocolType type,
+    gin::Arguments* args) {
   v8::Local<v8::Value> response;
-  if (!args->GetNext(&response) || response->IsNullOrUndefined() ||
-      (response->IsObject() &&
-       response.As<v8::Object>()
-               ->GetOwnPropertyNames(args->isolate()->GetCurrentContext())
-               .ToLocalChecked()
-               ->Length() == 0)) {
+  if (!args->GetNext(&response) ||
+      IsNullUndefinedOrEmptyObject(args->isolate(), response)) {
+    // For intercepted protocols, callback(), callback(undefined),
+    // callback(null) and callback({}) mean "do not handle this request here".
     mojo::Remote<network::mojom::URLLoaderFactory> target_factory_remote(
         std::move(target_factory));
-    // trigger receiver of itself but with kBypassCustomProtocolHandlers
+    // Trigger this receiver again while bypassing custom protocol handlers.
     target_factory_remote->CreateLoaderAndStart(
         std::move(loader), request_id, options | kBypassCustomProtocolHandlers,
         request, std::move(client), traffic_annotation);
     return;
-               }
+  }
+
   ElectronURLLoaderFactory::StartLoadingWithResponse(
       std::move(loader), request_id, options, request, std::move(client),
       traffic_annotation, std::move(target_factory), type, args->isolate(),
-      response);
+      args, response);
 }
-
 
 void ProxyingURLLoaderFactory::CreateLoaderAndStart(
     mojo::PendingReceiver<network::mojom::URLLoader> loader,
@@ -838,23 +1115,23 @@ void ProxyingURLLoaderFactory::CreateLoaderAndStart(
     request.load_flags |= net::LOAD_IGNORE_LIMITS;
   }
 
-  // Check if user has intercepted this scheme.
   bool bypass_custom_protocol_handlers =
       options & kBypassCustomProtocolHandlers;
   if (!bypass_custom_protocol_handlers) {
-  // Check if user has intercepted this scheme.
-  auto it = intercepted_handlers_.find(request.url.scheme());
-  if (it != intercepted_handlers_.end()) {
-    mojo::PendingRemote<network::mojom::URLLoaderFactory> loader_remote;
-    this->Clone(loader_remote.InitWithNewPipeAndPassReceiver());
+    // Check if user has intercepted this scheme.
+    auto it = intercepted_handlers_.find(request.url.scheme());
+    if (it != intercepted_handlers_.end()) {
+      mojo::PendingRemote<network::mojom::URLLoaderFactory> loader_remote;
+      this->Clone(loader_remote.InitWithNewPipeAndPassReceiver());
 
-    // <scheme, <type, handler>>
-    it->second.second.Run(
-        request, base::BindOnce(&ProxyingURLLoaderFactory::StartLoading,
-                                std::move(loader), request_id, options, request,
-                                std::move(client), traffic_annotation,
-                                std::move(loader_remote), it->second.first));
-    return;
+      // <scheme, <type, handler>>
+      it->second.second.Run(
+          request,
+          base::BindOnce(&ProxyingURLLoaderFactory::StartLoading,
+                         std::move(loader), request_id, options, request,
+                         std::move(client), traffic_annotation,
+                         std::move(loader_remote), it->second.first));
+      return;
     }
   }
 

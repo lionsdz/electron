@@ -5,12 +5,16 @@
 #ifndef ELECTRON_SHELL_BROWSER_NET_WEB_REQUEST_API_INTERFACE_H_
 #define ELECTRON_SHELL_BROWSER_NET_WEB_REQUEST_API_INTERFACE_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "extensions/browser/api/web_request/web_request_info.h"
 #include "net/base/completion_once_callback.h"
 #include "services/network/public/cpp/resource_request.h"
+#include "services/network/public/mojom/url_response_head.mojom.h"
 
 namespace electron {
 
@@ -48,6 +52,16 @@ class WebRequestAPI {
                                 const GURL& new_location) = 0;
   virtual void OnResponseStarted(extensions::WebRequestInfo* info,
                                  const network::ResourceRequest& request) = 0;
+  virtual bool ShouldCaptureResponseBody(
+      extensions::WebRequestInfo* info,
+      const network::ResourceRequest& request,
+      const network::mojom::URLResponseHead& response,
+      size_t* max_bytes) = 0;
+  virtual void OnResponseBody(extensions::WebRequestInfo* info,
+                              const network::ResourceRequest& request,
+                              const network::mojom::URLResponseHead& response,
+                              std::vector<uint8_t> body,
+                              bool truncated) = 0;
   virtual void OnErrorOccurred(extensions::WebRequestInfo* info,
                                const network::ResourceRequest& request,
                                int net_error) = 0;

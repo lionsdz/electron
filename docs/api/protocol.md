@@ -287,6 +287,9 @@ Returns `boolean` - Whether the protocol was successfully intercepted
 Intercepts `scheme` protocol and uses `handler` as the protocol's new handler
 which sends a `Buffer` as a response.
 
+Calling `callback()` without a response passes the request through to the
+original protocol handler.
+
 ### `protocol.interceptHttpProtocol(scheme, handler)`
 
 * `scheme` string

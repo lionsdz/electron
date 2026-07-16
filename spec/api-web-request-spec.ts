@@ -17,6 +17,12 @@ describe('webRequest module', () => {
       res.statusCode = 301;
       res.setHeader('Location', 'http://' + req.rawHeaders[1]);
       res.end();
+    } else if (req.url === '/responseBody') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ ok: true, value: 'response-body-test' }));
+    } else if (req.url === '/responseBodyText') {
+      res.setHeader('Content-Type', 'text/plain');
+      res.end('plain response body');
     } else if (req.url === '/contentDisposition') {
       res.setHeader('content-disposition', [' attachment; filename=aa%E4%B8%ADaa.txt']);
       const content = req.url;
@@ -399,6 +405,89 @@ describe('webRequest module', () => {
       const { data, headers } = await ajax(defaultURL);
       expect(headers).to.to.have.property('custom', 'Header');
       expect(data).to.equal('/');
+    });
+  });
+
+  describe('webRequest.onResponseBody', () => {
+    afterEach(() => {
+      ses.webRequest.onResponseBody(null);
+    });
+
+    it('requires a content type whitelist', () => {
+      expect(() => {
+        ses.webRequest.onResponseBody({
+          urls: [defaultURL + 'responseBody']
+        } as any, () => {});
+      }).to.throw(/contentTypes/);
+      expect(() => {
+        ses.webRequest.onResponseBody({
+          urls: [defaultURL + 'responseBody'],
+          contentTypes: ['   ']
+        }, () => {});
+      }).to.throw(/MIME type/);
+      expect(() => {
+        ses.webRequest.onResponseBody({
+          urls: [defaultURL + 'responseBody'],
+          contentTypes: ['application/json'],
+          maxBytes: 16 * 1024 * 1024 + 1
+        }, () => {});
+      }).to.throw(/between 1 and 16777216/);
+    });
+
+    it('captures matching response body without changing the page response', async () => {
+      const expectedBody = JSON.stringify({ ok: true, value: 'response-body-test' });
+      const captured = new Promise<any>(resolve => {
+        ses.webRequest.onResponseBody({
+          urls: [defaultURL + 'responseBody'],
+          resourceTypes: ['xhr'],
+          contentTypes: ['application/json'],
+          maxBytes: 8
+        }, details => {
+          resolve({
+            body: details.body,
+            bodySize: details.bodySize,
+            bodyTruncated: details.bodyTruncated,
+            maxBytes: details.maxBytes,
+            mimeType: details.mimeType,
+            resourceType: details.resourceType,
+            statusCode: details.statusCode,
+            url: details.url
+          });
+        });
+      });
+
+      const { data, headers } = await ajax(defaultURL + 'responseBody');
+      const details = await captured;
+
+      expect(data).to.equal(expectedBody);
+      expect(headers).to.have.property('content-type', 'application/json; charset=utf-8');
+      expect(Buffer.isBuffer(details.body)).to.be.true();
+      expect(details.body.toString()).to.equal(expectedBody.slice(0, 8));
+      expect(details.bodySize).to.equal(8);
+      expect(details.bodyTruncated).to.be.true();
+      expect(details.maxBytes).to.equal(8);
+      expect(details.mimeType).to.equal('application/json');
+      expect(details.resourceType).to.equal('xhr');
+      expect(details.statusCode).to.equal(200);
+      expect(details.url).to.equal(defaultURL + 'responseBody');
+    });
+
+    it('defaults to XHR captures and supports content type wildcards', async () => {
+      const captured = new Promise<any>(resolve => {
+        ses.webRequest.onResponseBody({
+          urls: [defaultURL + 'responseBodyText'],
+          contentTypes: ['text/*'],
+          maxBytes: 1024
+        }, details => resolve(details));
+      });
+
+      const { data } = await ajax(defaultURL + 'responseBodyText');
+      const details = await captured;
+
+      expect(data).to.equal('plain response body');
+      expect(details.body.toString()).to.equal(data);
+      expect(details.bodyTruncated).to.be.false();
+      expect(details.mimeType).to.equal('text/plain');
     });
   });
 

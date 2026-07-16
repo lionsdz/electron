@@ -111,6 +111,8 @@ class ProxyingURLLoaderFactory
                            OnHeadersReceivedCallback callback) override;
 
    private:
+    class ResponseBodyCapture;
+
     // These two methods combined form the implementation of Restart().
     void UpdateRequestInfo();
     void RestartInternal();
@@ -128,6 +130,12 @@ class ProxyingURLLoaderFactory
         net::CompletionOnceCallback continuation);
     void OnRequestError(const network::URLLoaderCompletionStatus& status);
     void HandleBeforeRequestRedirect();
+    mojo::ScopedDataPipeConsumerHandle MaybeStartResponseBodyCapture(
+        mojo::ScopedDataPipeConsumerHandle body);
+    void OnResponseBodyCaptureComplete(std::vector<uint8_t> body,
+                                       bool truncated);
+    void CompleteRequest(const network::URLLoaderCompletionStatus& status);
+    void DispatchCapturedResponseBody();
 
     ProxyingURLLoaderFactory* const factory_;
     network::ResourceRequest request_;
@@ -185,6 +193,11 @@ class ProxyingURLLoaderFactory
     std::unique_ptr<FollowRedirectParams> pending_follow_redirect_params_;
 
     absl::optional<mojo_base::BigBuffer> current_cached_metadata_;
+    std::unique_ptr<ResponseBodyCapture> response_body_capture_;
+    absl::optional<std::vector<uint8_t>> captured_response_body_;
+    bool captured_response_body_truncated_ = false;
+    absl::optional<network::URLLoaderCompletionStatus> pending_complete_status_;
+    bool target_completion_sent_ = false;
 
     base::WeakPtrFactory<InProgressRequest> weak_factory_{this};
   };

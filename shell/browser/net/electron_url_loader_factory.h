@@ -111,7 +111,7 @@ class ElectronURLLoaderFactory : public network::SelfDeletingURLLoaderFactory {
       const net::MutableNetworkTrafficAnnotationTag& traffic_annotation)
       override;
 
-    static void StartLoadingWithResponse(
+  static void StartLoadingWithResponse(
       mojo::PendingReceiver<network::mojom::URLLoader> loader,
       int32_t request_id,
       uint32_t options,
@@ -121,6 +121,7 @@ class ElectronURLLoaderFactory : public network::SelfDeletingURLLoaderFactory {
       mojo::PendingRemote<network::mojom::URLLoaderFactory> target_factory,
       ProtocolType type,
       v8::Isolate* isolate,
+      gin::Arguments* args,
       v8::Local<v8::Value> response);
 
   // disable copy
@@ -134,7 +135,7 @@ class ElectronURLLoaderFactory : public network::SelfDeletingURLLoaderFactory {
       mojo::PendingReceiver<network::mojom::URLLoaderFactory> factory_receiver);
   ~ElectronURLLoaderFactory() override;
 
-    static void StartLoading(
+  static void StartLoading(
       mojo::PendingReceiver<network::mojom::URLLoader> loader,
       int32_t request_id,
       uint32_t options,
