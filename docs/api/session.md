@@ -1001,13 +1001,20 @@ Electron never places this string on a child-process command line. It derives a
 fixed-size token with HMAC-SHA-256 and sends only that token. Persistent
 sessions keep their random HMAC secret in a dedicated versioned file. On first
 use, Electron serializes initialization across processes, atomically writes and
-flushes the file, and verifies an exact readback before allowing a renderer to
-use the profile. A lock, permission, write, flush, or verification failure is
-fail-closed: no temporary persona or renderer token is substituted. In-memory
-sessions use a random secret that exists only for that browser context's
-lifetime. Fingerprint profiles do not support Electron's `--single-process`
-mode because one process-wide Blink snapshot cannot safely represent multiple
-sessions.
+flushes the file, and verifies an exact readback. Every session partition
+initializes and owns this state independently when its browser context is
+created.
+
+A lock, permission, write, flush, or verification failure disables the custom
+profile for renderers created from that browser context: Electron logs the
+partition and profile path and omits the profile initialization and fingerprint
+command-line switches instead of terminating the browser process. After fixing
+the underlying storage condition, call `setFingerprint` again to retry
+initialization, then recreate the affected window. An already-running renderer
+is not upgraded in place. In-memory sessions use a random secret that exists
+only for that browser context's lifetime. Fingerprint profiles do not support
+Electron's `--single-process` mode because one process-wide Blink snapshot
+cannot safely represent multiple sessions.
 
 #### `ses.getFingerprint()`
 

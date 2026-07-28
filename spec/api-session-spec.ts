@@ -1390,6 +1390,18 @@ describe('session module', () => {
       const second = await getRendererFingerprintCommandLine(ses);
       expect(first.token).to.equal(second.token);
     });
+
+    it('initializes a late persistent partition after the default renderer starts', async () => {
+      const defaultCommandLine = await getRendererFingerprintCommandLine(session.defaultSession);
+      const lateSession = session.fromPartition(`persist:user_${Math.random()}`);
+      lateSession.setFingerprint('late-login-window');
+
+      const lateCommandLine = await getRendererFingerprintCommandLine(lateSession);
+      expect(defaultCommandLine.token).to.match(/^v1\.[A-Za-z0-9_-]{43}$/);
+      expect(lateCommandLine.token).to.match(/^v1\.[A-Za-z0-9_-]{43}$/);
+      expect(lateCommandLine.tokenRequired).to.be.true();
+      expect(lateCommandLine.token).to.not.equal(defaultCommandLine.token);
+    });
   });
 
   describe('session-created event', () => {

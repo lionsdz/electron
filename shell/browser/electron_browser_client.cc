@@ -543,10 +543,6 @@ void ElectronBrowserClient::AppendExtraCommandLineSwitches(
   }
 
   if (process_type == ::switches::kRendererProcess) {
-    CHECK(!content::RenderProcessHost::run_renderer_in_process())
-        << "Fingerprint profiles require renderer process isolation";
-    command_line->AppendSwitch(
-        FingerprintProfile::kFingerprintTokenRequiredSwitch);
 #if BUILDFLAG(IS_WIN)
     // Append --app-user-model-id.
     PWSTR current_app_id;
@@ -562,31 +558,81 @@ void ElectronBrowserClient::AppendExtraCommandLineSwitches(
       command_line->AppendSwitchPath(switches::kAppPath, app_path);
     }
 
-    auto env = base::Environment::Create();
-    if (env->HasVar("ELECTRON_PROFILE_INIT_SCRIPTS")) {
-      command_line->AppendSwitch("profile-electron-init");
-    }
-
     content::RenderProcessHost* process =
         content::RenderProcessHost::FromID(process_id);
-    CHECK(process && process->GetBrowserContext())
-        << "Renderer process has no fingerprint BrowserContext";
-    auto* browser_context =
-        static_cast<ElectronBrowserContext*>(process->GetBrowserContext());
-    command_line->AppendSwitchASCII(
-        FingerprintProfile::kFingerprintTokenSwitch,
-        browser_context->GetFingerprintTokenForRenderer());
+    content::BrowserContext* browser_context =
+        process ? process->GetBrowserContext() : nullptr;
+    absl::optional<ElectronBrowserContext::FingerprintProfileSnapshot>
+        fingerprint_profile;
+    if (!content::RenderProcessHost::run_renderer_in_process() &&
+        browser_context) {
+      fingerprint_profile =
+          ElectronBrowserContext::AcquireFingerprintProfileForRenderer(
+              browser_context);
+    }
 
-    command_line->AppendSwitchASCII(
-        FingerprintProfile::kFingerprintIgnoreMaskSwitch,
-        base::NumberToString(
-            ElectronBrowserContext::GetFingerprintIgnoredDomainMask()));
+    if (content::RenderProcessHost::run_renderer_in_process()) {
+      LOG(ERROR) << "Skipping custom renderer fingerprint parameters"
+                 << " process_type=" << process_type
+                 << " child_process_id=" << process_id
+                 << " partition=<unavailable>"
+                 << " profile_path=<unavailable>"
+                 << " config_state=renderer_process_isolation_disabled";
+    } else if (!process) {
+      LOG(ERROR) << "Skipping custom renderer fingerprint parameters"
+                 << " process_type=" << process_type
+                 << " child_process_id=" << process_id
+                 << " partition=<unavailable>"
+                 << " profile_path=<unavailable>"
+                 << " config_state=render_process_host_missing";
+    } else if (!browser_context) {
+      LOG(ERROR) << "Skipping custom renderer fingerprint parameters"
+                 << " process_type=" << process_type
+                 << " child_process_id=" << process_id
+                 << " partition=<unavailable>"
+                 << " profile_path=<unavailable>"
+                 << " config_state=browser_context_missing";
+    } else if (!fingerprint_profile) {
+      LOG(ERROR) << "Skipping custom renderer fingerprint parameters"
+                 << " process_type=" << process_type
+                 << " child_process_id=" << process_id
+                 << " partition=<unavailable>"
+                 << " profile_path=<unavailable>"
+                 << " config_state=profile_registration_missing";
+    } else if (!fingerprint_profile->is_ready() ||
+               fingerprint_profile->token.empty()) {
+      LOG(ERROR) << "Skipping custom renderer fingerprint parameters"
+                 << " process_type=" << process_type
+                 << " child_process_id=" << process_id
+                 << " partition=" << fingerprint_profile->partition
+                 << " profile_path="
+                 << fingerprint_profile->profile_path.AsUTF8Unsafe()
+                 << " config_state="
+                 << ElectronBrowserContext::FingerprintProfileStatusToString(
+                        fingerprint_profile->status)
+                 << " status=" << fingerprint_profile->status_message;
+    } else {
+      auto env = base::Environment::Create();
+      if (env->HasVar("ELECTRON_PROFILE_INIT_SCRIPTS"))
+        command_line->AppendSwitch("profile-electron-init");
+
+      command_line->AppendSwitch(
+          FingerprintProfile::kFingerprintTokenRequiredSwitch);
+      command_line->AppendSwitchASCII(
+          FingerprintProfile::kFingerprintTokenSwitch,
+          fingerprint_profile->token);
+      command_line->AppendSwitchASCII(
+          FingerprintProfile::kFingerprintIgnoreMaskSwitch,
+          base::NumberToString(fingerprint_profile->ignored_domain_mask));
+    }
 
     // Extension background pages don't have WebContentsPreferences, but they
     // support WebSQL by default.
 #if BUILDFLAG(ENABLE_ELECTRON_EXTENSIONS)
-    if (process && extensions::ProcessMap::Get(process->GetBrowserContext())
-                       ->Contains(process_id))
+    auto* extension_process_map =
+        browser_context ? extensions::ProcessMap::Get(browser_context)
+                        : nullptr;
+    if (extension_process_map && extension_process_map->Contains(process_id))
       command_line->AppendSwitch(switches::kEnableWebSQL);
 #endif
 

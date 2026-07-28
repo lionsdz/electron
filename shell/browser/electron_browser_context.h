@@ -8,12 +8,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <array>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "base/memory/ref_counted.h"
 #include "base/memory/weak_ptr.h"
 #include "chrome/browser/predictors/preconnect_manager.h"
 #include "content/public/browser/browser_context.h"
@@ -60,6 +60,7 @@ using DevicePermissionMap =
 class ElectronDownloadManagerDelegate;
 class ElectronPermissionManager;
 class CookieChangeNotifier;
+class FingerprintProfileConfig;
 class ResolveProxyHelper;
 class WebViewManager;
 class ProtocolRegistry;
@@ -78,6 +79,29 @@ class ElectronBrowserContext : public content::BrowserContext {
     kSuccess,
     kLocked,
     kUnavailable,
+  };
+
+  struct FingerprintProfileSnapshot {
+    enum class Status {
+      kInitializing,
+      kReady,
+      kUnavailable,
+      kDestroying,
+    };
+
+    FingerprintProfileSnapshot();
+    FingerprintProfileSnapshot(const FingerprintProfileSnapshot&);
+    FingerprintProfileSnapshot& operator=(const FingerprintProfileSnapshot&);
+    ~FingerprintProfileSnapshot();
+
+    Status status = Status::kInitializing;
+    std::string status_message;
+    std::string partition;
+    base::FilePath profile_path;
+    std::string token;
+    uint64_t ignored_domain_mask = 0;
+
+    bool is_ready() const { return status == Status::kReady; }
   };
 
   // disable copy
@@ -160,10 +184,13 @@ class ElectronBrowserContext : public content::BrowserContext {
   std::string GetFingerprint() const;
   SetFingerprintResult SetFingerprint(const std::string& fingerprint);
   static uint64_t GetFingerprintIgnoredDomainMask();
-  // Locks the profile for this BrowserContext and returns the only value that
-  // is propagated to a renderer. The returned token never contains the public
-  // seed or the persistent secret.
-  const std::string& GetFingerprintTokenForRenderer();
+  // Looks up and locks a live BrowserContext's profile for renderer use. The
+  // returned value is a copy and remains safe if the BrowserContext is
+  // destroyed immediately after this call.
+  static absl::optional<FingerprintProfileSnapshot>
+  AcquireFingerprintProfileForRenderer(content::BrowserContext* context);
+  static const char* FingerprintProfileStatusToString(
+      FingerprintProfileSnapshot::Status status);
   base::WeakPtr<ElectronBrowserContext> GetWeakPtr() {
     return weak_factory_.GetWeakPtr();
   }
@@ -222,8 +249,6 @@ class ElectronBrowserContext : public content::BrowserContext {
 
   // Initialize pref registry.
   void InitPrefs();
-  void InitFingerprintSecret();
-  void UpdateFingerprintToken();
 
   bool DoesDeviceMatch(const base::Value& device,
                        const base::Value* device_to_compare,
@@ -244,13 +269,7 @@ class ElectronBrowserContext : public content::BrowserContext {
 
   absl::optional<std::string> user_agent_;
   std::string partition_;
-  std::string fingerprint_;
-  std::array<uint8_t, 32> fingerprint_secret_{};
-  std::string fingerprint_token_;
-  absl::optional<uint32_t> device_memory_client_hint_profile_;
-  std::string fingerprint_initialization_error_;
-  bool fingerprint_ready_ = false;
-  bool fingerprint_locked_ = false;
+  scoped_refptr<FingerprintProfileConfig> fingerprint_profile_;
   base::FilePath path_;
   bool in_memory_ = false;
   bool use_cache_ = true;
